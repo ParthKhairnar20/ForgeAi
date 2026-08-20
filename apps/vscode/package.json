@@ -1,0 +1,61 @@
+{
+  "name": "@forgeai/vscode",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "forgeai",
+          "title": "ForgeAI",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "forgeai": [
+        {
+          "type": "webview",
+          "id": "forgeai.chat",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "forgeai.startTask",
+        "title": "ForgeAI: Start Task"
+      },
+      {
+        "command": "forgeai.cancelTask",
+        "title": "ForgeAI: Cancel Task"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p tsconfig.json",
+    "watch": "tsc -watch -p tsconfig.json",
+    "pretest": "npm run compile",
+    "test": "vitest run",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@forgeai/agent": "workspace:*",
+    "@forgeai/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.74.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.2.0",
+    "vscode-test": "^1.5.0"
+  }
+}

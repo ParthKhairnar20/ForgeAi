@@ -1,0 +1,188 @@
+# ForgeAI
+
+ForgeAI is a personal coding agent that lives inside VS Code. It reads your repository, reasons about coding tasks, and uses built-in tools to make changes — all powered by local LLMs via Gemini or OpenRouter.
+
+## Current Architecture
+
+```
+VS Code Extension
+    ↓ (task only, no API keys)
+ForgeAI Server (Fastify, port 4141)
+    ↓
+Agent Loop
+    ↓
+ModelRouter
+    ↓
+Primary Provider: Gemini (GEMINI_API_KEY env var)
+    ↓ (fallback on failure)
+Fallback Provider: OpenRouter (OPENROUTER_API_KEY env var)
+```
+
+## Current Capabilities
+
+- **7 built-in tools**: `read_file`, `write_file`, `list_files`, `search_files`, `run_command`, `git_status`, `git_diff`
+- **Context discovery**: keyword + symbol-based file ranking with sensitive file exclusion
+- **Streaming responses**: real-time SSE from model to VS Code webview
+- **Model fallback**: Gemini → OpenRouter automatic fallback on failure
+- **Cancellation**: cancel running tasks from VS Code
+- **Self-correction**: agent retries with corrected actions when tools fail
+- **Security**: path traversal prevention, sensitive file exclusion, command destructive-pattern blocklist
+
+## Current Limitations
+
+- Single-agent only (no multi-agent orchestration)
+- No persistent memory or database
+- No vector search / embeddings
+- Context discovery is file-level (no AST-aware yet)
+- OpenRouter/Groq/Ollama are partially implemented
+- Windows requires Visual Studio C++ build tools for some optional dependencies
+
+## Requirements
+
+- **Node.js**: >= 18.0.0 (native `fetch` required)
+- **pnpm**: 8.15.0 (recommended) or compatible
+- **OS**: Windows, macOS, or Linux
+- **VS Code**: >= 1.80.0 (for extension development)
+
+## Windows Setup
+
+```powershell
+# Install Node.js from https://nodejs.org/
+# Verify installation
+node --version   # should be >= 18.0.0
+
+# Install pnpm
+npm install -g pnpm
+
+# Verify pnpm
+pnpm --version
+```
+
+## Installation
+
+```powershell
+# Clone the repository
+git clone <repository-url>
+cd Forge-Ai
+
+# Install dependencies
+pnpm install
+```
+
+## Provider Configuration
+
+ForgeAI reads API keys from **server-side environment variables**. The VS Code extension never sends API keys to the server.
+
+### Gemini
+
+```powershell
+# PowerShell
+$env:GEMINI_API_KEY = "your-gemini-api-key"
+```
+
+```bash
+# Git Bash / WSL
+export GEMINI_API_KEY="your-gemini-api-key"
+```
+
+### OpenRouter
+
+```powershell
+# PowerShell
+$env:OPENROUTER_API_KEY = "your-openrouter-api-key"
+```
+
+```bash
+# Git Bash / WSL
+export OPENROUTER_API_KEY="your-openrouter-api-key"
+```
+
+## Provider Configuration in VS Code
+
+Open VS Code settings (`Ctrl+,`) and search for `forgeai`:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `forgeai.serverUrl` | `http://127.0.0.1:4141` | ForgeAI server URL |
+| `forgeai.provider.type` | `gemini` | Provider: `gemini`, `openrouter`, `mock` |
+| `forgeai.provider.model` | `gemini-pro` | Model name (provider-specific) |
+
+## Starting the Server
+
+```powershell
+# Development mode (with hot reload if configured)
+pnpm --filter @forgeai/server run dev
+
+# Or directly
+node apps/server/dist/index.js
+```
+
+Server runs at `http://127.0.0.1:4141`.
+
+## Launching VS Code Extension
+
+1. Open the repository in VS Code
+2. Press `F5` to launch Extension Development Host
+3. In the new window, open a workspace
+4. Press `Ctrl+Shift+P` → `ForgeAI: Start Task`
+5. Enter a coding task
+
+## Running Tests
+
+```powershell
+# Run all tests
+pnpm test
+
+# Run specific package tests
+pnpm --filter @forgeai/core test
+pnpm --filter @forgeai/agent test
+```
+
+## Running Builds
+
+```powershell
+# Build all packages
+pnpm build
+
+# Build specific package
+pnpm --filter @forgeai/core run build
+pnpm --filter @forgeai/agent run build
+pnpm --filter @forgeai/server run build
+```
+
+## Type Checking
+
+```powershell
+pnpm typecheck
+```
+
+## Security Model
+
+- **API keys**: Never leave the server. VS Code extension sends only provider type and model name.
+- **Path traversal**: All file tools validate paths against workspace root using `path.resolve()`.
+- **Sensitive files**: `.env`, `*.key`, `*.pem`, `credentials.json`, `id_rsa`, etc. are excluded from context and blocked from reading.
+- **Command safety**: Destructive commands (`rm -rf`, `format`, `shutdown`, fork bombs) are blocked by pattern matching.
+- **Workspace boundary**: Tools cannot access files outside the opened workspace.
+
+## Troubleshooting
+
+### "Missing API key for provider gemini"
+Set the `GEMINI_API_KEY` environment variable before starting the server.
+
+### "Another task is already running"
+Only one task can run at a time. Cancel the current task via `ForgeAI: Cancel Task` command, or restart the server.
+
+### "tree-sitter install failed"
+Tree-sitter native parsers require Visual Studio C++ build tools on Windows. ForgeAI falls back to regex-based symbol extraction automatically. This is expected behavior on Windows without VS build tools.
+
+### Port 4141 already in use
+Stop the existing ForgeAI server process, or change the port in `apps/server/src/index.ts`.
+
+### Extension not activating
+Check the Extension Development Host console (`Help → Toggle Developer Tools`) for errors. Ensure the server is running.
+
+## Roadmap
+
+- **Phase 3**: Tool reliability, streaming UX improvements, token counting
+- **Phase 4**: Multi-agent architecture
+- **Phase 5**: Conversation persistence, vector search
