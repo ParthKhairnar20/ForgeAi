@@ -2,7 +2,7 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 
 import { ForgeAIConfig, resolveProviderApiKey } from "@forgeai/core";
-import { AgentEvent, AgentLoop } from "@forgeai/agent";
+import { AgentLoop } from "@forgeai/agent";
 
 const fastify = Fastify({ logger: true });
 
