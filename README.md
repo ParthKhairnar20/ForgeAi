@@ -21,12 +21,40 @@ Fallback Provider: OpenRouter (OPENROUTER_API_KEY env var)
 ## Current Capabilities
 
 - **7 built-in tools**: `read_file`, `write_file`, `list_files`, `search_files`, `run_command`, `git_status`, `git_diff`
+- **Structured tool results**: every tool returns a typed result with stable machine-readable error codes (`ToolErrorCode`), human-readable messages, a `recoverable` flag, and metadata (duration, exit code, bytes read/written)
 - **Context discovery**: keyword + symbol-based file ranking with sensitive file exclusion
 - **Streaming responses**: real-time SSE from model to VS Code webview
 - **Model fallback**: Gemini → OpenRouter automatic fallback on failure
 - **Cancellation**: cancel running tasks from VS Code
 - **Self-correction**: agent retries with corrected actions when tools fail
 - **Security**: path traversal prevention, sensitive file exclusion, command destructive-pattern blocklist
+- **Command hardening**: per-stream 100 KB output limits, 30 s timeout with process kill, cancellation-aware child process termination, structured error classification
+
+## Command Execution (run_command)
+
+`run_command` executes shell commands inside the workspace with the following behavior:
+
+| Aspect | Behavior |
+|--------|----------|
+| **Windows** | Commands run through `powershell.exe -NoProfile -NonInteractive`. Exit codes are propagated via `exit $LASTEXITCODE`; output formatting is forced synchronous via `Out-String`. |
+| **Linux/macOS** | Commands are tokenized and executed directly via `spawn` (no shell). |
+| **stdout / stderr** | Captured separately and returned in distinct `--- stdout ---` / `--- stderr ---` sections. stderr alone does not fail a command if the exit code is 0. |
+| **Exit codes** | Non-zero exit → `COMMAND_FAILED` error with `metadata.exitCode`. Unknown commands → `COMMAND_NOT_FOUND`. |
+| **Output limit** | Each stream is capped at 100 KB. Excess output is discarded and `metadata.truncated: true` is set. This prevents huge command output from consuming the agent context. |
+| **Timeout** | Commands are killed after 30 seconds (configurable via `FORGEAI_COMMAND_TIMEOUT_MS` env var) and return a `TIMEOUT` error. The child process is killed with SIGKILL to avoid orphans. |
+| **Cancellation** | Agent cancellation kills the running child process immediately and returns a `CANCELLED` error (distinct from `TIMEOUT` and `COMMAND_FAILED`). |
+
+### Command parsing limitations
+
+Commands are tokenized respecting double/single quotes (e.g. `node -e "console.log('x')"` works). Known limitations:
+
+- Escaped quotes inside quoted segments (`"`) are not supported.
+- Shell operators (`&&`, `||`, pipes, redirection) are not interpreted — each command runs as a single program invocation.
+- Mixed quoting edge cases may differ slightly from native shell parsing.
+
+### Command safety limitations
+
+Command execution is **not a full sandbox**. A small blocklist blocks clearly destructive commands (`rm -rf`, `del /f`, `rmdir`, `rd /s`, `format`, `mkfs`, `shutdown`, `restart`, `diskpart`, fork bombs), but arbitrary non-blocklisted commands can still modify files within (or outside, subject to OS permissions) the workspace. Only run ForgeAI on trusted workspaces.
 
 ## Current Limitations
 
@@ -161,7 +189,7 @@ pnpm typecheck
 - **API keys**: Never leave the server. VS Code extension sends only provider type and model name.
 - **Path traversal**: All file tools validate paths against workspace root using `path.resolve()`.
 - **Sensitive files**: `.env`, `*.key`, `*.pem`, `credentials.json`, `id_rsa`, etc. are excluded from context and blocked from reading.
-- **Command safety**: Destructive commands (`rm -rf`, `format`, `shutdown`, fork bombs) are blocked by pattern matching.
+- **Command safety**: Destructive commands (`rm -rf`, `del /f`, `rmdir`, `rd /s`, `format`, `mkfs`, `shutdown`, `restart`, `diskpart`, fork bombs) are blocked by pattern matching. Note: this is reasonable V0.3.1 safety, not enterprise sandboxing.
 - **Workspace boundary**: Tools cannot access files outside the opened workspace.
 
 ## Troubleshooting

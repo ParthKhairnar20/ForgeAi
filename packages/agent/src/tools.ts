@@ -1,6 +1,6 @@
 ﻿import * as fs from "fs/promises";
 import * as path from "path";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { promisify } from "util";
 
@@ -18,7 +18,20 @@ import {
 const execFileAsync = promisify(execFile);
 
 const MAX_FILE_SIZE = 1_000_000;
-const DESTRUCTIVE_PATTERNS = [/^rm\s+-rf\s/, /^del\s+\/f\s/, /^rmdir\s+\/s\s/, /^format\s/, /^mkfs\s/, /^shutdown\s/, /^:\(\)\{.*\|\:.*\&\}\;/];
+const DESTRUCTIVE_PATTERNS = [
+  /^rm\s+-rf(\s|$)/, /^del\s+\/f(\s|$)/, /^rmdir(\s|$)/, /^rd\s+\/s(\s|$)/,
+  /^format(\s|$)/, /^mkfs(\s|$)/, /^shutdown(\s|$)/, /^restart(\s|$)/, /^diskpart(\s|$)/,
+  /^:\(\)\{.*\|\:.*\&\}\;/,
+];
+// v0.3.1: per-stream output limit for run_command (prevents unbounded context growth)
+const COMMAND_OUTPUT_LIMIT_BYTES = 100 * 1024;
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+
+/** Timeout is configurable via FORGEAI_COMMAND_TIMEOUT_MS (ms) for testing/embedding. */
+function getCommandTimeoutMs(): number {
+  const value = Number(process.env.FORGEAI_COMMAND_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_COMMAND_TIMEOUT_MS;
+}
 const IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "coverage", ".vscode", "build", "tmp", "temp"]);
 const BINARY_EXTENSIONS = new Set([
   ".bin", ".exe", ".dll", ".so", ".dylib", ".o", ".a", ".lib", ".pyc", ".class",
@@ -118,13 +131,13 @@ async function findRipgrep(): Promise<string | null> {
   return null;
 }
 
-async function withPermission(
+async function withPermission<T>(
   evaluator: PermissionEvaluator,
   category: CommandCategory,
   pattern: string,
-  action: () => Promise<string>,
+  action: () => Promise<T>,
   ctx: ToolContext
-): Promise<{ result: string; durationMs: number }> {
+): Promise<{ result: T; durationMs: number }> {
   const start = Date.now();
   if (evaluator.isBlocked(category, pattern)) {
     throw new Error(`Permission denied: ${category} operation "${pattern}" is blocked by policy.`);
@@ -357,6 +370,130 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
     },
   };
 
+  interface CommandExecution {
+    stdout: string;
+    stderr: string;
+    exitCode: number | null;
+    timedOut: boolean;
+    cancelled: boolean;
+    stdoutTruncated: boolean;
+    stderrTruncated: boolean;
+    spawnError?: string;
+  }
+
+  /**
+   * Executes a command via spawn with per-stream output limits, timeout and
+   * cancellation support. Never throws — all outcomes are reported in the
+   * returned CommandExecution so callers can classify errors deterministically.
+   *
+   * Known parsing limitation (documented): on Unix the raw command string is
+   * split on whitespace; quoted arguments containing spaces are not supported.
+   * On Windows the command is passed to PowerShell which handles quoting.
+   */
+  function executeCommand(
+    executable: string,
+    execArgs: string[],
+    cwd: string,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<CommandExecution> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let timedOut = false;
+      let stdout = "";
+      let stderr = "";
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+
+      const child = spawn(executable, execArgs, { cwd, windowsHide: true });
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeoutMs);
+
+      const onAbort = () => {
+        child.kill("SIGKILL");
+      };
+      if (signal) {
+        if (signal.aborted) {
+          clearTimeout(timer);
+          child.kill("SIGKILL");
+          resolve({ stdout: "", stderr: "", exitCode: null, timedOut: false, cancelled: true, stdoutTruncated: false, stderrTruncated: false });
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (stdoutBytes + chunk.length <= COMMAND_OUTPUT_LIMIT_BYTES) {
+          stdoutBytes += chunk.length;
+          stdout += chunk.toString("utf-8");
+        } else {
+          stdoutTruncated = true;
+        }
+      });
+
+      child.stderr.on("data", (chunk: Buffer) => {
+        if (stderrBytes + chunk.length <= COMMAND_OUTPUT_LIMIT_BYTES) {
+          stderrBytes += chunk.length;
+          stderr += chunk.toString("utf-8");
+        } else {
+          stderrTruncated = true;
+        }
+      });
+
+      child.on("error", (err: NodeJS.ErrnoException) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
+        resolve({
+          stdout,
+          stderr,
+          exitCode: null,
+          timedOut,
+          cancelled: signal?.aborted ?? false,
+          stdoutTruncated,
+          stderrTruncated,
+          spawnError: err.code ?? err.message,
+        });
+      });
+
+      child.on("close", (code: number | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
+        resolve({
+          stdout,
+          stderr,
+          exitCode: code,
+          timedOut,
+          cancelled: signal?.aborted ?? false,
+          stdoutTruncated,
+          stderrTruncated,
+        });
+      });
+    });
+  }
+
+  function formatCommandOutput(exec: CommandExecution): string {
+    const sections: string[] = [];
+    if (exec.stdout.trim()) {
+      sections.push(`--- stdout ---\n${exec.stdout.trimEnd()}`);
+    }
+    if (exec.stderr.trim()) {
+      sections.push(`--- stderr ---\n${exec.stderr.trimEnd()}`);
+    }
+    if (sections.length === 0) {
+      return "(no output)";
+    }
+    return sections.join("\n\n");
+  }
+
   const runCommandTool: ToolDefinition = {
     name: "run_command",
     description: "Execute a shell command in the workspace directory. Use with caution.",
@@ -382,45 +519,89 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
         }
       }
 
+      // Permission check first (approval may be rejected before any process starts)
       try {
-        const { result: output, durationMs } = await withPermission(evaluator, "shell", command, async () => {
-          if (ctx.platform === "win32") {
-            const executable = "powershell.exe";
-            const executableArgs = [
-              "-NoProfile",
-              "-NonInteractive",
-              "-Command",
-              `& ${toPowerShellLiteral(command)} ${cmdArgs.map(toPowerShellLiteral).join(" ")}`,
-            ];
-            const { stdout } = await execFileAsync(executable, executableArgs, {
-              cwd: ctx.workspaceRoot,
-              maxBuffer: 1024 * 1024 * 10,
-              timeout: 30000,
-              windowsHide: true,
-            });
-            return stdout;
-          }
-
-          // On Unix-like platforms, split the command into executable + args
-          const parts = command.trim().split(/\s+/);
-          const executable = parts[0];
-          const unixArgs = [...parts.slice(1), ...cmdArgs];
-          const { stdout } = await execFileAsync(executable, unixArgs, {
-            cwd: ctx.workspaceRoot,
-            maxBuffer: 1024 * 1024 * 10,
-            timeout: 30000,
-            windowsHide: true,
-          });
-          return stdout;
-        }, ctx);
-        return createSuccessResult("run_command", toolCallId, output, { durationMs, exitCode: 0 });
+        await withPermission(evaluator, "shell", command, async () => undefined, ctx);
       } catch (error) {
-        const err = error as NodeJS.ErrnoException;
-        if (err.code === "ENOENT") {
-          return createErrorResult("run_command", toolCallId, ToolErrorCode.COMMAND_NOT_FOUND, `Command not found: ${command}`, true, { durationMs: Date.now() - start });
-        }
-        return createErrorResult("run_command", toolCallId, ToolErrorCode.COMMAND_FAILED, `Command failed: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
+        return createErrorResult("run_command", toolCallId, ToolErrorCode.PERMISSION_DENIED, (error as Error).message, false, { durationMs: Date.now() - start });
       }
+
+      // Build platform-specific execution plan.
+      // Both platforms tokenize the command respecting quotes so that inline
+      // arguments such as `node -e "code here"` work correctly.
+      const tokens = tokenizeCommand(command);
+      if (tokens.length === 0) {
+        return createErrorResult("run_command", toolCallId, ToolErrorCode.INVALID_ARGUMENT, "Command must not be empty.", false, { durationMs: Date.now() - start });
+      }
+
+      let executable: string;
+      let execArgs: string[];
+      if (ctx.platform === "win32") {
+        // `Out-String` forces synchronous output formatting (otherwise `exit`
+        // can terminate before formatted output is flushed), and
+        // `exit $LASTEXITCODE` propagates the native child's exit code through
+        // powershell.exe (PS 5.1 does not do this automatically).
+        executable = "powershell.exe";
+        execArgs = [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `& ${tokens.map(toPowerShellLiteral).join(" ")}${cmdArgs.length ? " " + cmdArgs.map(toPowerShellLiteral).join(" ") : ""} | Out-String; exit $LASTEXITCODE`,
+        ];
+      } else {
+        executable = tokens[0];
+        execArgs = [...tokens.slice(1), ...cmdArgs];
+      }
+
+      // Wire agent cancellation to an AbortSignal so the child process is killed
+      const abortController = new AbortController();
+      if (ctx.cancellationToken) {
+        ctx.cancellationToken.onCancelled(() => abortController.abort());
+      }
+
+      const exec = await executeCommand(executable, execArgs, ctx.workspaceRoot, getCommandTimeoutMs(), abortController.signal);
+
+      const durationMs = Date.now() - start;
+      const totalOutputBytes = Buffer.byteLength(exec.stdout, "utf-8") + Buffer.byteLength(exec.stderr, "utf-8");
+
+      // Classification order matters: cancellation > timeout > spawn error > exit code
+      if (exec.cancelled) {
+        return createErrorResult("run_command", toolCallId, ToolErrorCode.CANCELLED, "Command cancelled.", false, { durationMs, cancelled: true, stdout: exec.stdout || undefined, stderr: exec.stderr || undefined });
+      }
+      if (exec.timedOut) {
+        return createErrorResult("run_command", toolCallId, ToolErrorCode.TIMEOUT, `Command timed out after ${getCommandTimeoutMs()}ms: ${command}`, true, { durationMs, timedOut: true, stdout: exec.stdout || undefined, stderr: exec.stderr || undefined });
+      }
+      if (exec.spawnError) {
+        if (exec.spawnError === "ENOENT") {
+          return createErrorResult("run_command", toolCallId, ToolErrorCode.COMMAND_NOT_FOUND, `Command not found: ${executable}`, true, { durationMs });
+        }
+        return createErrorResult("run_command", toolCallId, ToolErrorCode.COMMAND_FAILED, `Failed to start command: ${exec.spawnError}`, true, { durationMs });
+      }
+      // On Windows the outer process is powershell.exe (which always exists),
+      // so unknown *inner* commands surface as a non-zero exit with a
+      // recognizable stderr message rather than a spawn ENOENT.
+      const notRecognized = /is not recognized as (the name of a cmdlet|an internal or external command)/i.test(exec.stderr);
+      if (notRecognized) {
+        return createErrorResult("run_command", toolCallId, ToolErrorCode.COMMAND_NOT_FOUND, `Command not found: ${tokens[0]}`, true, { durationMs, exitCode: exec.exitCode ?? undefined, stderr: exec.stderr || undefined });
+      }
+      if (exec.exitCode !== 0 && exec.exitCode !== null) {
+        return createErrorResult("run_command", toolCallId, ToolErrorCode.COMMAND_FAILED, `Command exited with code ${exec.exitCode}: ${command}`, true, {
+          durationMs,
+          exitCode: exec.exitCode,
+          truncated: (exec.stdoutTruncated || exec.stderrTruncated) || undefined,
+          stdout: exec.stdout || undefined,
+          stderr: exec.stderr || undefined,
+        });
+      }
+
+      return createSuccessResult("run_command", toolCallId, formatCommandOutput(exec), {
+        durationMs,
+        exitCode: 0,
+        bytesRead: totalOutputBytes,
+        truncated: (exec.stdoutTruncated || exec.stderrTruncated) || undefined,
+        stdout: exec.stdout || undefined,
+        stderr: exec.stderr || undefined,
+      });
     },
   };
 
@@ -493,6 +674,40 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       }
     }
     return files;
+  }
+
+  /**
+   * Tokenizes a command string respecting double and single quotes.
+   * Example: `node -e "console.log('x')"` -> ["node", "-e", "console.log('x')"]
+   *
+   * Known limitations (documented):
+   * - Escaped quotes inside quoted segments (\") are not supported.
+   * - Mixed quoting edge cases may differ slightly from native shell parsing.
+   */
+  function tokenizeCommand(command: string): string[] {
+    const tokens: string[] = [];
+    let current = "";
+    let quote: '"' | "'" | null = null;
+    for (const ch of command.trim()) {
+      if (quote) {
+        if (ch === quote) {
+          quote = null;
+          continue;
+        }
+        current += ch;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (/\s/.test(ch)) {
+        if (current) {
+          tokens.push(current);
+          current = "";
+        }
+      } else {
+        current += ch;
+      }
+    }
+    if (current) tokens.push(current);
+    return tokens;
   }
 
   function toPowerShellLiteral(value: string): string {
