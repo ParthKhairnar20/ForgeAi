@@ -36,6 +36,9 @@ export interface AgentLoopOptions {
   cancellationToken?: { cancelled: boolean; onCancelled: (cb: () => void) => void };
 }
 
+/** v0.3.2: maximum cursor-based pagination requests allowed per agent run. */
+const MAX_PAGINATION_REQUESTS_PER_RUN = 10;
+
 export class AgentLoop {
   private readonly provider: ModelProvider;
   private readonly tools: Map<string, ToolDefinition>;
@@ -43,6 +46,8 @@ export class AgentLoop {
   private readonly state: AgentLoopState;
   private readonly maxIterations: number;
   private abortController: AbortController | null = null;
+  /** v0.3.2: counts cursor-based pagination requests within the current run. */
+  private paginationRequests = 0;
 
   constructor(
     private readonly config: ForgeAIConfig,
@@ -85,6 +90,7 @@ export class AgentLoop {
     this.state.status = "thinking";
     this.state.messages.push(this.createUserMessage(userMessage));
     this.abortController = new AbortController();
+    this.paginationRequests = 0;
 
     try {
       const contextFiles = await discoverContextFiles(this.config.workspaceRoot, userMessage, this.config.contextWindowLimit);
@@ -249,6 +255,24 @@ export class AgentLoop {
       }
 
       try {
+        // v0.3.2: guard against unbounded pagination loops. Cursor-based
+        // requests are counted per run; beyond the limit the call is rejected
+        // with a structured error instead of executing.
+        if (typeof call.arguments?.cursor === "string" && call.arguments.cursor.trim()) {
+          this.paginationRequests++;
+          if (this.paginationRequests > MAX_PAGINATION_REQUESTS_PER_RUN) {
+            results.push(createErrorResult(
+              call.name,
+              call.id,
+              ToolErrorCode.INVALID_CURSOR,
+              `Pagination limit reached (${MAX_PAGINATION_REQUESTS_PER_RUN} page requests per task). Work with the output you have or re-run the tool without a cursor.`,
+              false,
+              { durationMs: 0 }
+            ));
+            continue;
+          }
+        }
+
         const result = await tool.handler(call.arguments, this.toolContext);
         result.toolCallId = call.id;
         results.push(result);
@@ -320,9 +344,15 @@ export class AgentLoop {
   }
 
   private createToolResultMessage(result: ToolResult): Message {
-    const content = result.success
+    let content = result.success
       ? `[${result.name}]\n${String(result.output ?? "")}`
       : `[${result.name}] ERROR [${result.error?.code ?? "UNKNOWN_ERROR"}]: ${result.error?.message ?? "Unknown error"}`;
+
+    // v0.3.2: tell the model more output is available and how to fetch it.
+    const pag = result.metadata?.pagination;
+    if (result.success && pag?.hasMore && pag.nextCursor) {
+      content += `\n[output truncated to page ${pag.page} — more output available. Call ${result.name} again with {"cursor": "${pag.nextCursor}"} to retrieve the next page.]`;
+    }
 
     return {
       id: randomUUID(),
@@ -336,6 +366,7 @@ export class AgentLoop {
         durationMs: result.metadata?.durationMs ?? 0,
         errorCode: result.error?.code,
         errorRecoverable: result.error?.recoverable,
+        hasMoreOutput: pag?.hasMore ?? false,
       },
     };
   }

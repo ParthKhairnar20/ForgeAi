@@ -210,7 +210,7 @@ describe("run_command hardening (v0.3.1)", () => {
     expect(result.error?.recoverable).toBe(false);
   });
 
-  it("output exceeding limit is truncated with truncated metadata", async () => {
+  it("large output is paginated with bounded first page (v0.3.2)", async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "forgeai-cmd-"));
     tools = makeTools();
     const tool = tools.get("run_command")!;
@@ -221,9 +221,28 @@ describe("run_command hardening (v0.3.1)", () => {
     );
 
     expect(result.success).toBe(true);
+    // First page is bounded to COMMAND_PAGE_SIZE_BYTES (16 KB)
+    expect((result.output as string).length).toBeLessThanOrEqual(17 * 1024);
+    expect(result.metadata?.pagination?.hasMore).toBe(true);
+    expect(typeof result.metadata?.pagination?.nextCursor).toBe("string");
+  });
+
+  it("output beyond the pagination buffer cap is truncated (v0.3.1 protection)", async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "forgeai-cmd-"));
+    tools = makeTools();
+    const tool = tools.get("run_command")!;
+
+    const result = await tool.handler(
+      { command: `node -e "console.log('y'.repeat(2000000))"` },
+      makeCtx(tmpDir)
+    );
+
+    expect(result.success).toBe(true);
+    // 2 MB output exceeds PAGINATION_MAX_BUFFER_BYTES (1 MB) per stream,
+    // so the raw capture was truncated.
     expect(result.metadata?.truncated).toBe(true);
-    // Output must be bounded well below the generated 200KB
-    expect((result.output as string).length).toBeLessThan(150 * 1024);
+    // First page remains bounded regardless
+    expect((result.output as string).length).toBeLessThanOrEqual(17 * 1024);
   });
 
   it("structured metadata includes durationMs and bytesRead", async () => {

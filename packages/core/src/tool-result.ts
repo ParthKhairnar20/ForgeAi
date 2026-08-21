@@ -24,6 +24,7 @@ export const ToolErrorCode = {
   CANCELLED: "CANCELLED",
   BINARY_FILE: "BINARY_FILE",
   OUTPUT_LIMIT: "OUTPUT_LIMIT",
+  INVALID_CURSOR: "INVALID_CURSOR",
   UNKNOWN_ERROR: "UNKNOWN_ERROR",
 } as const;
 
@@ -38,6 +39,25 @@ export interface ToolError {
   recoverable: boolean;
 }
 
+/**
+ * Machine-readable pagination information attached to a ToolResult when the
+ * output was too large to fit in a single bounded response.
+ *
+ * - `page` / `pageSize`: 1-based index of the current page and its size.
+ * - `hasMore`: whether additional pages exist.
+ * - `nextCursor`: opaque single-use token used to request the next page.
+ *   Cursors are scoped to the originating tool invocation and cannot be
+ *   reused or manipulated to access unrelated data.
+ */
+export interface ToolPagination {
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
+  nextCursor?: string;
+  totalItems?: number;
+  totalBytes?: number;
+}
+
 export interface ToolMetadata {
   durationMs?: number;
   exitCode?: number;
@@ -48,6 +68,7 @@ export interface ToolMetadata {
   stderr?: string;
   cancelled?: boolean;
   timedOut?: boolean;
+  pagination?: ToolPagination;
 }
 
 export interface ToolResult<T = unknown> {

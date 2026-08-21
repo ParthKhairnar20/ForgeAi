@@ -11,9 +11,12 @@ import {
   ToolDefinition,
   ToolResult,
   ToolErrorCode,
+  ToolMetadata,
+  ToolPagination,
   createSuccessResult,
   createErrorResult,
 } from "@forgeai/core";
+import { paginationStore, chunkText, PAGINATION_MAX_BUFFER_BYTES } from "./pagination.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -26,6 +29,14 @@ const DESTRUCTIVE_PATTERNS = [
 // v0.3.1: per-stream output limit for run_command (prevents unbounded context growth)
 const COMMAND_OUTPUT_LIMIT_BYTES = 100 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+// v0.3.2: pagination page sizes (first response is always bounded)
+const COMMAND_PAGE_SIZE_BYTES = 16 * 1024;
+const READ_FILE_PAGE_LINES = 400;
+const READ_FILE_PAGE_MAX_BYTES = 64 * 1024;
+const SEARCH_PAGE_SIZE = 50;
+const SEARCH_MAX_RESULTS = 2000;
+const LIST_FILES_PAGE_SIZE = 100;
+const LIST_FILES_MAX_ENTRIES = 5000;
 
 /** Timeout is configurable via FORGEAI_COMMAND_TIMEOUT_MS (ms) for testing/embedding. */
 function getCommandTimeoutMs(): number {
@@ -152,6 +163,161 @@ async function withPermission<T>(
   return { result, durationMs: Date.now() - start };
 }
 
+/** Extracts an optional pagination cursor from tool arguments. */
+function getCursorArg(args: Record<string, unknown>): string | undefined {
+  const value = args.cursor;
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/** Builds a structured error for invalid/expired/consumed cursors. */
+function cursorError(name: string, toolCallId: string): ToolResult {
+  return createErrorResult(
+    name,
+    toolCallId,
+    ToolErrorCode.INVALID_CURSOR,
+    "Invalid, expired, or already-used pagination cursor. Re-run the tool without a cursor to start over.",
+    false
+  );
+}
+
+/**
+ * Builds a success result whose output is bounded to one page.
+ * When the text spans multiple pages, pages 2..N are buffered in the
+ * pagination store behind an opaque single-use cursor.
+ * Security note: `fullText` must already be security-filtered — pagination
+ * never bypasses filtering because it only slices pre-filtered content.
+ */
+function buildPaginatedResult(
+  name: string,
+  toolCallId: string,
+  fullText: string,
+  pageSizeBytes: number,
+  metadata: ToolMetadata
+): ToolResult {
+  const pages = chunkText(fullText, pageSizeBytes);
+  const firstPage = pages[0] ?? "";
+
+  if (pages.length <= 1) {
+    return createSuccessResult(name, toolCallId, firstPage, metadata);
+  }
+
+  const nextCursor = paginationStore.store(pages.slice(1), name);
+  const pagination: ToolPagination = {
+    page: 1,
+    pageSize: Buffer.byteLength(firstPage, "utf-8"),
+    hasMore: true,
+    nextCursor,
+    totalBytes: Buffer.byteLength(fullText, "utf-8"),
+  };
+  return createSuccessResult(name, toolCallId, firstPage, { ...metadata, pagination });
+}
+
+// ---------------------------------------------------------------------------
+// v0.3.2: incremental file reading (bounded memory; never loads whole file)
+// ---------------------------------------------------------------------------
+
+interface FilePageState {
+  filePath: string;
+  offset: number;
+}
+const FILE_PAGE_MAX_ENTRIES = 50;
+const FILE_PAGE_TTL_MS = 15 * 60 * 1000;
+const filePageStates = new Map<string, { state: FilePageState; createdAt: number }>();
+
+function storeFilePageState(state: FilePageState): string {
+  // Evict expired / enforce bound
+  const now = Date.now();
+  for (const [key, entry] of filePageStates) {
+    if (now - entry.createdAt > FILE_PAGE_TTL_MS) filePageStates.delete(key);
+  }
+  while (filePageStates.size >= FILE_PAGE_MAX_ENTRIES) {
+    const oldest = filePageStates.keys().next().value;
+    if (oldest === undefined) break;
+    filePageStates.delete(oldest);
+  }
+  const cursor = randomUUID();
+  filePageStates.set(cursor, { state, createdAt: now });
+  return cursor;
+}
+
+function takeFilePageState(cursor: string): FilePageState | null {
+  const entry = filePageStates.get(cursor);
+  if (!entry) return null;
+  filePageStates.delete(cursor); // single-use
+  return entry.state;
+}
+
+interface FilePageRead {
+  content: string;
+  endOffset: number;
+  hasMore: boolean;
+}
+
+/**
+ * Reads one bounded page of lines from `filePath` starting at byte offset
+ * `startOffset`. Memory-bounded: reads at most ~64 KB chunks and stops as soon
+ * as the page limits are reached. Line boundaries are found in raw bytes so
+ * multi-byte UTF-8 sequences are never split mid-line.
+ */
+async function readFilePage(
+  filePath: string,
+  startOffset: number
+): Promise<FilePageRead> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const lines: string[] = [];
+    let contentBytes = 0;
+    let position = startOffset;
+    let carryover = Buffer.alloc(0);
+    let eofReached = false;
+
+    while (!eofReached) {
+      const buf = Buffer.alloc(64 * 1024);
+      const { bytesRead } = await handle.read(buf, 0, buf.length, position);
+      if (bytesRead === 0) {
+        eofReached = true;
+        break;
+      }
+      position += bytesRead;
+      const data = Buffer.concat([carryover, buf.subarray(0, bytesRead)]);
+      carryover = Buffer.alloc(0);
+
+      let searchFrom = 0;
+      while (true) {
+        const nl = data.indexOf(0x0a, searchFrom);
+        if (nl === -1) {
+          carryover = Buffer.from(data.subarray(searchFrom));
+          break;
+        }
+        const lineEnd = nl + 1; // include the newline
+        const lineBytes = lineEnd - searchFrom;
+        if (lines.length >= READ_FILE_PAGE_LINES || contentBytes + lineBytes > READ_FILE_PAGE_MAX_BYTES) {
+          // Page full — rewind to the start of this unconsumed line.
+          const consumedUpTo = position - data.length + searchFrom;
+          return { content: lines.join(""), endOffset: consumedUpTo, hasMore: true };
+        }
+        lines.push(data.toString("utf-8", searchFrom, lineEnd));
+        contentBytes += lineBytes;
+        searchFrom = lineEnd;
+      }
+    }
+
+    // EOF reached: include trailing partial line when it fits.
+    if (carryover.length > 0) {
+      if (lines.length < READ_FILE_PAGE_LINES && contentBytes + carryover.length <= READ_FILE_PAGE_MAX_BYTES) {
+        lines.push(carryover.toString("utf-8"));
+        return { content: lines.join(""), endOffset: position, hasMore: false };
+      }
+      // Trailing partial line does not fit in this page.
+      return { content: lines.join(""), endOffset: position - carryover.length, hasMore: true };
+    }
+
+    return { content: lines.join(""), endOffset: position, hasMore: false };
+  } finally {
+    await handle.close();
+  }
+}
+
 export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefinition[] {
   const readFileTool: ToolDefinition = {
     name: "read_file",
@@ -169,6 +335,37 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       const toolCallId = randomUUID();
       const userPath = String(args.path);
       const start = Date.now();
+
+      // v0.3.2: continuation request for a previous read_file page.
+      // The stored path is re-validated against every security check so a
+      // later page can never bypass workspace/sensitive-file protections.
+      const cursor = getCursorArg(args);
+      if (cursor) {
+        const state = takeFilePageState(cursor);
+        if (!state) return cursorError("read_file", toolCallId);
+
+        // Re-run all security checks on the stored path
+        try {
+          await validateWorkspacePath(ctx.workspaceRoot, state.filePath);
+        } catch {
+          return cursorError("read_file", toolCallId);
+        }
+        if (isBinary(state.filePath) || isSensitiveFile(path.basename(state.filePath))) {
+          return cursorError("read_file", toolCallId);
+        }
+
+        try {
+          const page = await readFilePage(state.filePath, state.offset);
+          const metadata: ToolMetadata = { durationMs: Date.now() - start };
+          if (page.hasMore) {
+            const nextCursor = storeFilePageState({ filePath: state.filePath, offset: page.endOffset });
+            metadata.pagination = { page: 2, pageSize: Buffer.byteLength(page.content, "utf-8"), hasMore: true, nextCursor };
+          }
+          return createSuccessResult("read_file", toolCallId, page.content, metadata);
+        } catch (error) {
+          return createErrorResult("read_file", toolCallId, ToolErrorCode.FILE_READ_FAILED, `Failed to continue reading file: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
+        }
+      }
 
       let filePath: string;
       try {
@@ -191,8 +388,22 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
           return createErrorResult("read_file", toolCallId, ToolErrorCode.OUTPUT_LIMIT, `File exceeds maximum size of ${MAX_FILE_SIZE} bytes.`, false, { durationMs: Date.now() - start });
         }
 
-        const { result: output, durationMs } = await withPermission(evaluator, "file_read", userPath, async () => fs.readFile(filePath, "utf-8"), ctx);
-        return createSuccessResult("read_file", toolCallId, output, { durationMs, bytesRead: stat.size });
+        // Small files fit in one page — read directly (backward compatible).
+        if (stat.size <= READ_FILE_PAGE_MAX_BYTES) {
+          const { result: output, durationMs } = await withPermission(evaluator, "file_read", userPath, async () => fs.readFile(filePath, "utf-8"), ctx);
+          return createSuccessResult("read_file", toolCallId, output, { durationMs, bytesRead: stat.size });
+        }
+
+        // Large file: bounded incremental first page
+        const { result: allowed, durationMs } = await withPermission(evaluator, "file_read", userPath, async () => true, ctx);
+        void allowed;
+        const page = await readFilePage(filePath, 0);
+        const metadata: ToolMetadata = { durationMs, bytesRead: page.endOffset };
+        if (page.hasMore) {
+          const nextCursor = storeFilePageState({ filePath, offset: page.endOffset });
+          metadata.pagination = { page: 1, pageSize: Buffer.byteLength(page.content, "utf-8"), hasMore: true, nextCursor, totalBytes: stat.size };
+        }
+        return createSuccessResult("read_file", toolCallId, page.content, metadata);
       } catch (error) {
         const err = error as NodeJS.ErrnoException;
         if (err.code === "ENOENT") {
@@ -268,15 +479,42 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
 
       const gitignorePatterns = await getGitignorePatterns(ctx.workspaceRoot);
 
+      // v0.3.2: continuation request for a previous list_files page.
+      const cursor = getCursorArg(args);
+      if (cursor) {
+        const page = paginationStore.fetch(cursor, "list_files");
+        if (!page) return cursorError("list_files", toolCallId);
+        const metadata: ToolMetadata = { durationMs: Date.now() - start };
+        if (page.hasMore && page.nextCursor) {
+          metadata.pagination = { page: page.page + 1, pageSize: page.pageSize, hasMore: true, nextCursor: page.nextCursor };
+        }
+        return createSuccessResult("list_files", toolCallId, page.content, metadata);
+      }
+
       try {
         const { result: output, durationMs } = await withPermission(evaluator, "file_read", userPath, async () => {
           const entries = await fs.readdir(dirPath, { withFileTypes: true });
           const matched = entries
             .filter((e) => !shouldIgnore(e.name, gitignorePatterns) && !isSensitiveFile(e.name))
+            .slice(0, LIST_FILES_MAX_ENTRIES)
             .map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
-          return JSON.stringify(matched, null, 2);
+
+          // v0.3.2: paginate large listings (security filtering happens first)
+          const pages: string[] = [];
+          for (let i = 0; i < matched.length; i += LIST_FILES_PAGE_SIZE) {
+            pages.push(JSON.stringify(matched.slice(i, i + LIST_FILES_PAGE_SIZE), null, 2));
+          }
+          if (pages.length === 0) pages.push(JSON.stringify([], null, 2));
+          return { pages, totalItems: matched.length };
         }, ctx);
-        return createSuccessResult("list_files", toolCallId, output, { durationMs });
+
+        const [firstPage, ...restPages] = output.pages;
+        const metadata: ToolMetadata = { durationMs };
+        if (restPages.length > 0) {
+          const nextCursor = paginationStore.store(restPages, "list_files");
+          metadata.pagination = { page: 1, pageSize: LIST_FILES_PAGE_SIZE, hasMore: true, nextCursor, totalItems: output.totalItems };
+        }
+        return createSuccessResult("list_files", toolCallId, firstPage, metadata);
       } catch (error) {
         const err = error as NodeJS.ErrnoException;
         if (err.code === "ENOENT") {
@@ -316,6 +554,18 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       const rg = await findRipgrep();
       const gitignorePatterns = await getGitignorePatterns(ctx.workspaceRoot);
 
+      // v0.3.2: continuation request for a previous search_files page.
+      const cursor = getCursorArg(args);
+      if (cursor) {
+        const page = paginationStore.fetch(cursor, "search_files");
+        if (!page) return cursorError("search_files", toolCallId);
+        const metadata: ToolMetadata = { durationMs: Date.now() - start };
+        if (page.hasMore && page.nextCursor) {
+          metadata.pagination = { page: page.page + 1, pageSize: page.pageSize, hasMore: true, nextCursor: page.nextCursor };
+        }
+        return createSuccessResult("search_files", toolCallId, page.content, metadata);
+      }
+
       try {
         const { result: output, durationMs } = await withPermission(evaluator, "search", userPath, async () => {
           if (rg) {
@@ -325,9 +575,12 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
                 maxBuffer: 1024 * 1024 * 10,
                 windowsHide: true,
               });
+              // Security filtering happens BEFORE pagination and BEFORE the
+              // hard cap — filtered-out matches are never buffered or paged.
               const results: { file: string; line: number; content: string }[] = [];
               for (const line of stdout.split("\n")) {
                 if (!line.trim()) continue;
+                if (results.length >= SEARCH_MAX_RESULTS) break;
                 const match = line.match(/^(.+?):(\d+):(.*)$/);
                 if (!match) continue;
                 const file = match[1];
@@ -335,9 +588,9 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
                 if (isSensitiveFile(path.basename(file)) || shouldIgnore(relative, gitignorePatterns)) continue;
                 results.push({ file, line: parseInt(match[2], 10), content: match[3] });
               }
-              return JSON.stringify(results, null, 2);
+              return results;
             } catch (error: any) {
-              if (error.code === 1) return JSON.stringify([], null, 2);
+              if (error.code === 1) return [];
               throw error;
             }
           }
@@ -345,6 +598,7 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
           const results: { file: string; line: number; content: string }[] = [];
           const files = await getAllFiles(searchPath, gitignorePatterns);
           for (const file of files) {
+            if (results.length >= SEARCH_MAX_RESULTS) break;
             const relative = path.relative(ctx.workspaceRoot, file);
             if (shouldIgnore(relative, gitignorePatterns)) continue;
             if (isBinary(file)) continue;
@@ -355,15 +609,29 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
             const content = await fs.readFile(file, "utf-8").catch(() => null);
             if (!content) continue;
             const lines = content.split("\n");
-            lines.forEach((line, idx) => {
-              if (line.includes(query)) {
-                results.push({ file: relative, line: idx + 1, content: line.trim() });
+            for (let idx = 0; idx < lines.length && results.length < SEARCH_MAX_RESULTS; idx++) {
+              if (lines[idx].includes(query)) {
+                results.push({ file: relative, line: idx + 1, content: lines[idx].trim() });
               }
-            });
+            }
           }
-          return JSON.stringify(results, null, 2);
+          return results;
         }, ctx);
-        return createSuccessResult("search_files", toolCallId, output, { durationMs });
+
+        // v0.3.2: paginate the already-filtered match list.
+        const pages: string[] = [];
+        for (let i = 0; i < output.length; i += SEARCH_PAGE_SIZE) {
+          pages.push(JSON.stringify(output.slice(i, i + SEARCH_PAGE_SIZE), null, 2));
+        }
+        if (pages.length === 0) pages.push(JSON.stringify([], null, 2));
+
+        const [firstPage, ...restPages] = pages;
+        const metadata: ToolMetadata = { durationMs };
+        if (restPages.length > 0) {
+          const nextCursor = paginationStore.store(restPages, "search_files");
+          metadata.pagination = { page: 1, pageSize: SEARCH_PAGE_SIZE, hasMore: true, nextCursor, totalItems: output.length };
+        }
+        return createSuccessResult("search_files", toolCallId, firstPage, metadata);
       } catch (error) {
         return createErrorResult("search_files", toolCallId, ToolErrorCode.SEARCH_FAILED, `Search failed: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
       }
@@ -513,6 +781,18 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       const cmdArgs = Array.isArray(args.args) ? args.args.map(String) : [];
       const start = Date.now();
 
+      // v0.3.2: continuation request for a previous run_command output page.
+      const cursor = getCursorArg(args);
+      if (cursor) {
+        const page = paginationStore.fetch(cursor, "run_command");
+        if (!page) return cursorError("run_command", toolCallId);
+        const metadata: ToolMetadata = { durationMs: Date.now() - start };
+        if (page.hasMore && page.nextCursor) {
+          metadata.pagination = { page: page.page + 1, pageSize: page.pageSize, hasMore: true, nextCursor: page.nextCursor };
+        }
+        return createSuccessResult("run_command", toolCallId, page.content, metadata);
+      }
+
       for (const pattern of DESTRUCTIVE_PATTERNS) {
         if (pattern.test(command.trim())) {
           return createErrorResult("run_command", toolCallId, ToolErrorCode.COMMAND_NOT_ALLOWED, `Destructive command blocked by policy: ${command}`, false, { durationMs: Date.now() - start });
@@ -594,14 +874,19 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
         });
       }
 
-      return createSuccessResult("run_command", toolCallId, formatCommandOutput(exec), {
+      // v0.3.2: bounded first page with continuation cursor for large output.
+      // stdout/stderr separation is preserved inside the formatted text.
+      const fullOutput = formatCommandOutput(exec);
+      const baseMetadata: ToolMetadata = {
         durationMs,
         exitCode: 0,
         bytesRead: totalOutputBytes,
         truncated: (exec.stdoutTruncated || exec.stderrTruncated) || undefined,
-        stdout: exec.stdout || undefined,
-        stderr: exec.stderr || undefined,
-      });
+        // Only embed raw streams when small enough to keep results bounded.
+        stdout: exec.stdout.length <= 4096 ? exec.stdout : undefined,
+        stderr: exec.stderr.length <= 4096 ? exec.stderr : undefined,
+      };
+      return buildPaginatedResult("run_command", toolCallId, fullOutput, COMMAND_PAGE_SIZE_BYTES, baseMetadata);
     },
   };
 
@@ -614,18 +899,41 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       type: "object",
       properties: {},
     },
-    handler: async (_args, ctx) => {
+    handler: async (args, ctx) => {
       const toolCallId = randomUUID();
       const start = Date.now();
 
+      // v0.3.2: continuation request for a previous git_status page.
+      const cursor = getCursorArg(args);
+      if (cursor) {
+        const page = paginationStore.fetch(cursor, "git_status");
+        if (!page) return cursorError("git_status", toolCallId);
+        const metadata: ToolMetadata = { durationMs: Date.now() - start };
+        if (page.hasMore && page.nextCursor) {
+          metadata.pagination = { page: page.page + 1, pageSize: page.pageSize, hasMore: true, nextCursor: page.nextCursor };
+        }
+        return createSuccessResult("git_status", toolCallId, page.content, metadata);
+      }
+
       try {
-        const { result: output, durationMs } = await withPermission(evaluator, "git", "git status", async () => {
-          const { stdout } = await execFileAsync("git", ["status", "--porcelain"], {
-            cwd: ctx.workspaceRoot,
-          });
-          return stdout || "Working tree clean.";
-        }, ctx);
-        return createSuccessResult("git_status", toolCallId, output, { durationMs, exitCode: 0 });
+        const { result: allowed, durationMs } = await withPermission(evaluator, "git", "git status", async () => true, ctx);
+        void allowed;
+        const exec = await executeCommand("git", ["status", "--porcelain"], ctx.workspaceRoot, getCommandTimeoutMs());
+        if (exec.spawnError) {
+          const detail = exec.spawnError === "ENOENT" ? "git executable not found" : exec.spawnError;
+          return createErrorResult("git_status", toolCallId, ToolErrorCode.GIT_FAILED, `Git status failed: ${detail}`, true, { durationMs: Date.now() - start });
+        }
+        if (exec.timedOut) {
+          return createErrorResult("git_status", toolCallId, ToolErrorCode.TIMEOUT, "Git status timed out.", true, { durationMs: Date.now() - start, timedOut: true });
+        }
+        if (exec.cancelled) {
+          return createErrorResult("git_status", toolCallId, ToolErrorCode.CANCELLED, "Git status cancelled.", false, { durationMs: Date.now() - start, cancelled: true });
+        }
+        if (exec.exitCode !== 0 && exec.exitCode !== null) {
+          return createErrorResult("git_status", toolCallId, ToolErrorCode.GIT_FAILED, `Git status failed with exit code ${exec.exitCode}`, true, { durationMs: Date.now() - start });
+        }
+        const fullOutput = exec.stdout.trim() || "Working tree clean.";
+        return buildPaginatedResult("git_status", toolCallId, fullOutput, COMMAND_PAGE_SIZE_BYTES, { durationMs: Date.now() - start, exitCode: 0 });
       } catch (error) {
         return createErrorResult("git_status", toolCallId, ToolErrorCode.GIT_FAILED, `Git status failed: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
       }
@@ -641,18 +949,44 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       type: "object",
       properties: {},
     },
-    handler: async (_args, ctx) => {
+    handler: async (args, ctx) => {
       const toolCallId = randomUUID();
       const start = Date.now();
 
+      // v0.3.2: continuation request for a previous git_diff page.
+      const cursor = getCursorArg(args);
+      if (cursor) {
+        const page = paginationStore.fetch(cursor, "git_diff");
+        if (!page) return cursorError("git_diff", toolCallId);
+        const metadata: ToolMetadata = { durationMs: Date.now() - start };
+        if (page.hasMore && page.nextCursor) {
+          metadata.pagination = { page: page.page + 1, pageSize: page.pageSize, hasMore: true, nextCursor: page.nextCursor };
+        }
+        return createSuccessResult("git_diff", toolCallId, page.content, metadata);
+      }
+
       try {
-        const { result: output, durationMs } = await withPermission(evaluator, "git", "git diff", async () => {
-          const { stdout } = await execFileAsync("git", ["diff"], {
-            cwd: ctx.workspaceRoot,
-          });
-          return stdout || "No changes.";
-        }, ctx);
-        return createSuccessResult("git_diff", toolCallId, output, { durationMs, exitCode: 0 });
+        const { result: allowed, durationMs } = await withPermission(evaluator, "git", "git diff", async () => true, ctx);
+        void allowed;
+        const exec = await executeCommand("git", ["diff"], ctx.workspaceRoot, getCommandTimeoutMs());
+        if (exec.spawnError) {
+          const detail = exec.spawnError === "ENOENT" ? "git executable not found" : exec.spawnError;
+          return createErrorResult("git_diff", toolCallId, ToolErrorCode.GIT_FAILED, `Git diff failed: ${detail}`, true, { durationMs: Date.now() - start });
+        }
+        if (exec.timedOut) {
+          return createErrorResult("git_diff", toolCallId, ToolErrorCode.TIMEOUT, "Git diff timed out.", true, { durationMs: Date.now() - start, timedOut: true });
+        }
+        if (exec.cancelled) {
+          return createErrorResult("git_diff", toolCallId, ToolErrorCode.CANCELLED, "Git diff cancelled.", false, { durationMs: Date.now() - start, cancelled: true });
+        }
+        if (exec.exitCode !== 0 && exec.exitCode !== null) {
+          return createErrorResult("git_diff", toolCallId, ToolErrorCode.GIT_FAILED, `Git diff failed with exit code ${exec.exitCode}`, true, { durationMs: Date.now() - start });
+        }
+        // Diff boundaries are preserved: chunking happens on the raw diff text
+        // at byte boundaries, never mid-line (chunkText splits on code points
+        // and diffs are line-oriented text).
+        const fullOutput = exec.stdout.trim() || "No changes.";
+        return buildPaginatedResult("git_diff", toolCallId, fullOutput, COMMAND_PAGE_SIZE_BYTES, { durationMs: Date.now() - start, exitCode: 0 });
       } catch (error) {
         return createErrorResult("git_diff", toolCallId, ToolErrorCode.GIT_FAILED, `Git diff failed: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
       }

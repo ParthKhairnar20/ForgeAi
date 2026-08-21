@@ -29,6 +29,7 @@ Fallback Provider: OpenRouter (OPENROUTER_API_KEY env var)
 - **Self-correction**: agent retries with corrected actions when tools fail
 - **Security**: path traversal prevention, sensitive file exclusion, command destructive-pattern blocklist
 - **Command hardening**: per-stream 100 KB output limits, 30 s timeout with process kill, cancellation-aware child process termination, structured error classification
+- **Tool output pagination**: large tool outputs are returned in bounded pages with opaque continuation cursors instead of being discarded (see below)
 
 ## Command Execution (run_command)
 
@@ -51,6 +52,34 @@ Commands are tokenized respecting double/single quotes (e.g. `node -e "console.l
 - Escaped quotes inside quoted segments (`"`) are not supported.
 - Shell operators (`&&`, `||`, pipes, redirection) are not interpreted — each command runs as a single program invocation.
 - Mixed quoting edge cases may differ slightly from native shell parsing.
+
+## Tool Output Pagination
+
+Large tool outputs no longer get discarded after the resource limit — they are returned as bounded pages that the agent can consume incrementally.
+
+| Tool | Page unit | First page bound |
+|------|-----------|------------------|
+| `run_command` | bytes of formatted stdout/stderr output | 16 KB |
+| `read_file` | lines (max 400 lines or 64 KB per page) | 64 KB |
+| `search_files` | result items | 50 matches |
+| `list_files` | directory entries | 100 entries |
+| `git_status` / `git_diff` | bytes of git output | 16 KB |
+
+How it works:
+
+1. The first response contains only a bounded page plus `metadata.pagination = { page, pageSize, hasMore: true, nextCursor }`.
+2. To fetch more, the agent calls the same tool again with `{ "cursor": "<nextCursor>" }`.
+3. Cursors are **opaque random tokens** — they carry no paths, commands, or data.
+4. Cursors are **single-use**: each fetch consumes the token and issues a fresh one for the remainder. Replaying a cursor returns an `INVALID_CURSOR` error.
+5. The final page reports `hasMore: false` with no cursor.
+
+Resource and security guarantees:
+
+- **Filtering before pagination**: sensitive-file exclusion, workspace-boundary checks, and search filtering always run BEFORE pages are created. A later page can never bypass security — page 2 is never "raw" data.
+- **read_file continuations re-validate everything**: the stored file path is re-checked against workspace boundaries, binary detection, and sensitive-file patterns on every page request; user-supplied paths are ignored on continuations.
+- **Bounded memory**: command output capture remains capped at 100 KB/stream (buffered up to 1 MB for pagination); files are read incrementally in ~64 KB chunks without loading the whole file; search results are capped at 2000 matches; listings at 5000 entries.
+- **Loop protection**: the agent may make at most 10 cursor-based page requests per task; beyond that it receives a structured `INVALID_CURSOR` error telling it to work with what it has.
+- **Pagination state**: held in memory only, max 50 active cursors with a 15-minute TTL.
 
 ### Command safety limitations
 
