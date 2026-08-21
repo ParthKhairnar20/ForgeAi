@@ -17,6 +17,8 @@ import {
   ToolContext,
   ToolDefinition,
   ToolResult,
+  ToolErrorCode,
+  createErrorResult,
 } from "@forgeai/core";
 import { createBuiltinTools } from "./tools.js";
 import { createProvider, ModelRouter } from "./providers/index.js";
@@ -235,15 +237,14 @@ export class AgentLoop {
 
       const tool = this.tools.get(call.name);
       if (!tool) {
-        results.push({
-          id: randomUUID(),
-          toolCallId: call.id,
-          name: call.name,
-          success: false,
-          output: "",
-          error: `Unknown tool: ${call.name}`,
-          durationMs: 0,
-        });
+        results.push(createErrorResult(
+          call.name,
+          call.id,
+          ToolErrorCode.UNKNOWN_ERROR,
+          `Unknown tool: ${call.name}`,
+          false,
+          { durationMs: 0 }
+        ));
         continue;
       }
 
@@ -253,15 +254,14 @@ export class AgentLoop {
         results.push(result);
         this.logger.info(`Tool ${call.name} executed: ${result.success ? "success" : "failure"}`);
       } catch (error) {
-        results.push({
-          id: randomUUID(),
-          toolCallId: call.id,
-          name: call.name,
-          success: false,
-          output: "",
-          error: String(error),
-          durationMs: 0,
-        });
+        results.push(createErrorResult(
+          call.name,
+          call.id,
+          ToolErrorCode.UNKNOWN_ERROR,
+          String(error),
+          true,
+          { durationMs: 0 }
+        ));
         this.logger.error(`Tool ${call.name} failed`, error as Error);
       }
     }
@@ -320,18 +320,22 @@ export class AgentLoop {
   }
 
   private createToolResultMessage(result: ToolResult): Message {
+    const content = result.success
+      ? `[${result.name}]\n${String(result.output ?? "")}`
+      : `[${result.name}] ERROR [${result.error?.code ?? "UNKNOWN_ERROR"}]: ${result.error?.message ?? "Unknown error"}`;
+
     return {
       id: randomUUID(),
       role: "tool",
-      content: result.success
-        ? `[${result.name}]\n${result.output}`
-        : `[${result.name}] ERROR: ${result.error}`,
+      content,
       timestamp: Date.now(),
       metadata: {
         name: result.name,
         toolCallId: result.toolCallId,
         success: result.success,
-        durationMs: result.durationMs,
+        durationMs: result.metadata?.durationMs ?? 0,
+        errorCode: result.error?.code,
+        errorRecoverable: result.error?.recoverable,
       },
     };
   }

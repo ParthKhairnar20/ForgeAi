@@ -1,3 +1,5 @@
+import type { ToolResult, ToolError, ToolMetadata, ToolErrorCode } from "./tool-result.js";
+
 export const PermissionLevel = {
   SAFE: "safe",
   APPROVAL: "approval",
@@ -45,16 +47,6 @@ export interface ToolCall {
   id: string;
   name: string;
   arguments: Record<string, unknown>;
-}
-
-export interface ToolResult {
-  id: string;
-  toolCallId: string;
-  name: string;
-  success: boolean;
-  output: string;
-  error?: string;
-  durationMs: number;
 }
 
 export interface ToolDefinition {

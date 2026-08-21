@@ -10,6 +10,9 @@ import {
   ToolContext,
   ToolDefinition,
   ToolResult,
+  ToolErrorCode,
+  createSuccessResult,
+  createErrorResult,
 } from "@forgeai/core";
 
 const execFileAsync = promisify(execFile);
@@ -150,24 +153,40 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       required: ["path"],
     },
     handler: async (args, ctx) => {
+      const toolCallId = randomUUID();
       const userPath = String(args.path);
-      const filePath = await validateWorkspacePath(ctx.workspaceRoot, userPath);
+      const start = Date.now();
+
+      let filePath: string;
+      try {
+        filePath = await validateWorkspacePath(ctx.workspaceRoot, userPath);
+      } catch (error) {
+        return createErrorResult("read_file", toolCallId, ToolErrorCode.PATH_OUTSIDE_WORKSPACE, (error as Error).message, false, { durationMs: Date.now() - start });
+      }
 
       if (isBinary(filePath)) {
-        return { id: randomUUID(), toolCallId: "", name: "read_file", success: false, output: "", error: "Cannot read binary files.", durationMs: 0 };
+        return createErrorResult("read_file", toolCallId, ToolErrorCode.BINARY_FILE, "Cannot read binary files.", false, { durationMs: Date.now() - start });
       }
 
       if (isSensitiveFile(path.basename(filePath))) {
-        return { id: randomUUID(), toolCallId: "", name: "read_file", success: false, output: "", error: "Cannot read sensitive files (credentials, keys, .env).", durationMs: 0 };
+        return createErrorResult("read_file", toolCallId, ToolErrorCode.SENSITIVE_FILE, "Cannot read sensitive files (credentials, keys, .env).", false, { durationMs: Date.now() - start });
       }
 
-      const stat = await fs.stat(filePath);
-      if (stat.size > MAX_FILE_SIZE) {
-        return { id: randomUUID(), toolCallId: "", name: "read_file", success: false, output: "", error: `File exceeds maximum size of ${MAX_FILE_SIZE} bytes.`, durationMs: 0 };
-      }
+      try {
+        const stat = await fs.stat(filePath);
+        if (stat.size > MAX_FILE_SIZE) {
+          return createErrorResult("read_file", toolCallId, ToolErrorCode.OUTPUT_LIMIT, `File exceeds maximum size of ${MAX_FILE_SIZE} bytes.`, false, { durationMs: Date.now() - start });
+        }
 
-      const { result: output, durationMs } = await withPermission(evaluator, "file_read", userPath, async () => fs.readFile(filePath, "utf-8"), ctx);
-      return { id: randomUUID(), toolCallId: "", name: "read_file", success: true, output, durationMs };
+        const { result: output, durationMs } = await withPermission(evaluator, "file_read", userPath, async () => fs.readFile(filePath, "utf-8"), ctx);
+        return createSuccessResult("read_file", toolCallId, output, { durationMs, bytesRead: stat.size });
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        if (err.code === "ENOENT") {
+          return createErrorResult("read_file", toolCallId, ToolErrorCode.FILE_NOT_FOUND, `File not found: ${userPath}`, true, { durationMs: Date.now() - start });
+        }
+        return createErrorResult("read_file", toolCallId, ToolErrorCode.FILE_READ_FAILED, `Failed to read file: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
+      }
     },
   };
 
@@ -185,16 +204,28 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       required: ["path", "content"],
     },
     handler: async (args, ctx) => {
+      const toolCallId = randomUUID();
       const userPath = String(args.path);
       const content = String(args.content);
-      const filePath = await validateWorkspacePath(ctx.workspaceRoot, userPath);
+      const start = Date.now();
 
-      const { result, durationMs } = await withPermission(evaluator, "file_write", userPath, async () => {
-        await fs.mkdir(path.dirname(filePath), { recursive: true });
-        await fs.writeFile(filePath, content, "utf-8");
-        return "ok";
-      }, ctx);
-      return { id: randomUUID(), toolCallId: "", name: "write_file", success: true, output: "File written successfully.", durationMs };
+      let filePath: string;
+      try {
+        filePath = await validateWorkspacePath(ctx.workspaceRoot, userPath);
+      } catch (error) {
+        return createErrorResult("write_file", toolCallId, ToolErrorCode.PATH_OUTSIDE_WORKSPACE, (error as Error).message, false, { durationMs: Date.now() - start });
+      }
+
+      try {
+        const { result, durationMs } = await withPermission(evaluator, "file_write", userPath, async () => {
+          await fs.mkdir(path.dirname(filePath), { recursive: true });
+          await fs.writeFile(filePath, content, "utf-8");
+          return "ok";
+        }, ctx);
+        return createSuccessResult("write_file", toolCallId, "File written successfully.", { durationMs, bytesWritten: Buffer.byteLength(content, "utf-8") });
+      } catch (error) {
+        return createErrorResult("write_file", toolCallId, ToolErrorCode.FILE_WRITE_FAILED, `Failed to write file: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
+      }
     },
   };
 
@@ -211,18 +242,35 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       required: ["path"],
     },
     handler: async (args, ctx) => {
+      const toolCallId = randomUUID();
       const userPath = String(args.path);
-      const dirPath = await validateWorkspacePath(ctx.workspaceRoot, userPath);
+      const start = Date.now();
+
+      let dirPath: string;
+      try {
+        dirPath = await validateWorkspacePath(ctx.workspaceRoot, userPath);
+      } catch (error) {
+        return createErrorResult("list_files", toolCallId, ToolErrorCode.PATH_OUTSIDE_WORKSPACE, (error as Error).message, false, { durationMs: Date.now() - start });
+      }
+
       const gitignorePatterns = await getGitignorePatterns(ctx.workspaceRoot);
 
-      const { result: output, durationMs } = await withPermission(evaluator, "file_read", userPath, async () => {
-        const entries = await fs.readdir(dirPath, { withFileTypes: true });
-        const matched = entries
-          .filter((e) => !shouldIgnore(e.name, gitignorePatterns) && !isSensitiveFile(e.name))
-          .map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
-        return JSON.stringify(matched, null, 2);
-      }, ctx);
-      return { id: randomUUID(), toolCallId: "", name: "list_files", success: true, output, durationMs };
+      try {
+        const { result: output, durationMs } = await withPermission(evaluator, "file_read", userPath, async () => {
+          const entries = await fs.readdir(dirPath, { withFileTypes: true });
+          const matched = entries
+            .filter((e) => !shouldIgnore(e.name, gitignorePatterns) && !isSensitiveFile(e.name))
+            .map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+          return JSON.stringify(matched, null, 2);
+        }, ctx);
+        return createSuccessResult("list_files", toolCallId, output, { durationMs });
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        if (err.code === "ENOENT") {
+          return createErrorResult("list_files", toolCallId, ToolErrorCode.DIRECTORY_NOT_FOUND, `Directory not found: ${userPath}`, true, { durationMs: Date.now() - start });
+        }
+        return createErrorResult("list_files", toolCallId, ToolErrorCode.FILE_READ_FAILED, `Failed to list directory: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
+      }
     },
   };
 
@@ -240,59 +288,72 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       required: ["path", "query"],
     },
     handler: async (args, ctx) => {
+      const toolCallId = randomUUID();
       const userPath = String(args.path);
       const query = String(args.query);
-      const searchPath = await validateWorkspacePath(ctx.workspaceRoot, userPath);
+      const start = Date.now();
+
+      let searchPath: string;
+      try {
+        searchPath = await validateWorkspacePath(ctx.workspaceRoot, userPath);
+      } catch (error) {
+        return createErrorResult("search_files", toolCallId, ToolErrorCode.PATH_OUTSIDE_WORKSPACE, (error as Error).message, false, { durationMs: Date.now() - start });
+      }
+
       const rg = await findRipgrep();
       const gitignorePatterns = await getGitignorePatterns(ctx.workspaceRoot);
 
-      const { result: output, durationMs } = await withPermission(evaluator, "search", userPath, async () => {
-        if (rg) {
-          try {
-            const { stdout } = await execFileAsync("rg", ["--no-heading", "--line-number", query, searchPath], {
-              cwd: ctx.workspaceRoot,
-              maxBuffer: 1024 * 1024 * 10,
-              windowsHide: true,
-            });
-            const results: { file: string; line: number; content: string }[] = [];
-            for (const line of stdout.split("\n")) {
-              if (!line.trim()) continue;
-              const match = line.match(/^(.+?):(\d+):(.*)$/);
-              if (!match) continue;
-              const file = match[1];
-              const relative = path.relative(ctx.workspaceRoot, file);
-              if (isSensitiveFile(path.basename(file)) || shouldIgnore(relative, gitignorePatterns)) continue;
-              results.push({ file, line: parseInt(match[2], 10), content: match[3] });
+      try {
+        const { result: output, durationMs } = await withPermission(evaluator, "search", userPath, async () => {
+          if (rg) {
+            try {
+              const { stdout } = await execFileAsync("rg", ["--no-heading", "--line-number", query, searchPath], {
+                cwd: ctx.workspaceRoot,
+                maxBuffer: 1024 * 1024 * 10,
+                windowsHide: true,
+              });
+              const results: { file: string; line: number; content: string }[] = [];
+              for (const line of stdout.split("\n")) {
+                if (!line.trim()) continue;
+                const match = line.match(/^(.+?):(\d+):(.*)$/);
+                if (!match) continue;
+                const file = match[1];
+                const relative = path.relative(ctx.workspaceRoot, file);
+                if (isSensitiveFile(path.basename(file)) || shouldIgnore(relative, gitignorePatterns)) continue;
+                results.push({ file, line: parseInt(match[2], 10), content: match[3] });
+              }
+              return JSON.stringify(results, null, 2);
+            } catch (error: any) {
+              if (error.code === 1) return JSON.stringify([], null, 2);
+              throw error;
             }
-            return JSON.stringify(results, null, 2);
-          } catch (error: any) {
-            if (error.code === 1) return JSON.stringify([], null, 2);
-            throw error;
           }
-        }
 
-        const results: { file: string; line: number; content: string }[] = [];
-        const files = await getAllFiles(searchPath, gitignorePatterns);
-        for (const file of files) {
-          const relative = path.relative(ctx.workspaceRoot, file);
-          if (shouldIgnore(relative, gitignorePatterns)) continue;
-          if (isBinary(file)) continue;
-          if (isSensitiveFile(path.basename(file))) continue;
-          const stat = await fs.stat(file);
-          if (stat.size > MAX_FILE_SIZE) continue;
+          const results: { file: string; line: number; content: string }[] = [];
+          const files = await getAllFiles(searchPath, gitignorePatterns);
+          for (const file of files) {
+            const relative = path.relative(ctx.workspaceRoot, file);
+            if (shouldIgnore(relative, gitignorePatterns)) continue;
+            if (isBinary(file)) continue;
+            if (isSensitiveFile(path.basename(file))) continue;
+            const stat = await fs.stat(file);
+            if (stat.size > MAX_FILE_SIZE) continue;
 
-          const content = await fs.readFile(file, "utf-8").catch(() => null);
-          if (!content) continue;
-          const lines = content.split("\n");
-          lines.forEach((line, idx) => {
-            if (line.includes(query)) {
-              results.push({ file: relative, line: idx + 1, content: line.trim() });
-            }
-          });
-        }
-        return JSON.stringify(results, null, 2);
-      }, ctx);
-      return { id: randomUUID(), toolCallId: "", name: "search_files", success: true, output, durationMs };
+            const content = await fs.readFile(file, "utf-8").catch(() => null);
+            if (!content) continue;
+            const lines = content.split("\n");
+            lines.forEach((line, idx) => {
+              if (line.includes(query)) {
+                results.push({ file: relative, line: idx + 1, content: line.trim() });
+              }
+            });
+          }
+          return JSON.stringify(results, null, 2);
+        }, ctx);
+        return createSuccessResult("search_files", toolCallId, output, { durationMs });
+      } catch (error) {
+        return createErrorResult("search_files", toolCallId, ToolErrorCode.SEARCH_FAILED, `Search failed: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
+      }
     },
   };
 
@@ -310,46 +371,56 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       required: ["command"],
     },
     handler: async (args, ctx) => {
+      const toolCallId = randomUUID();
       const command = String(args.command);
       const cmdArgs = Array.isArray(args.args) ? args.args.map(String) : [];
+      const start = Date.now();
 
       for (const pattern of DESTRUCTIVE_PATTERNS) {
         if (pattern.test(command.trim())) {
-          return { id: randomUUID(), toolCallId: "", name: "run_command", success: false, output: "", error: `Destructive command blocked by policy: ${command}`, durationMs: 0 };
+          return createErrorResult("run_command", toolCallId, ToolErrorCode.COMMAND_NOT_ALLOWED, `Destructive command blocked by policy: ${command}`, false, { durationMs: Date.now() - start });
         }
       }
 
-      const { result: output, durationMs } = await withPermission(evaluator, "shell", command, async () => {
-        if (ctx.platform === "win32") {
-          const executable = "powershell.exe";
-          const executableArgs = [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            `& ${toPowerShellLiteral(command)} ${cmdArgs.map(toPowerShellLiteral).join(" ")}`,
-          ];
-          const { stdout } = await execFileAsync(executable, executableArgs, {
+      try {
+        const { result: output, durationMs } = await withPermission(evaluator, "shell", command, async () => {
+          if (ctx.platform === "win32") {
+            const executable = "powershell.exe";
+            const executableArgs = [
+              "-NoProfile",
+              "-NonInteractive",
+              "-Command",
+              `& ${toPowerShellLiteral(command)} ${cmdArgs.map(toPowerShellLiteral).join(" ")}`,
+            ];
+            const { stdout } = await execFileAsync(executable, executableArgs, {
+              cwd: ctx.workspaceRoot,
+              maxBuffer: 1024 * 1024 * 10,
+              timeout: 30000,
+              windowsHide: true,
+            });
+            return stdout;
+          }
+
+          // On Unix-like platforms, split the command into executable + args
+          const parts = command.trim().split(/\s+/);
+          const executable = parts[0];
+          const unixArgs = [...parts.slice(1), ...cmdArgs];
+          const { stdout } = await execFileAsync(executable, unixArgs, {
             cwd: ctx.workspaceRoot,
             maxBuffer: 1024 * 1024 * 10,
             timeout: 30000,
             windowsHide: true,
           });
           return stdout;
+        }, ctx);
+        return createSuccessResult("run_command", toolCallId, output, { durationMs, exitCode: 0 });
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        if (err.code === "ENOENT") {
+          return createErrorResult("run_command", toolCallId, ToolErrorCode.COMMAND_NOT_FOUND, `Command not found: ${command}`, true, { durationMs: Date.now() - start });
         }
-
-        // On Unix-like platforms, split the command into executable + args
-        const parts = command.trim().split(/\s+/);
-        const executable = parts[0];
-        const unixArgs = [...parts.slice(1), ...cmdArgs];
-        const { stdout } = await execFileAsync(executable, unixArgs, {
-          cwd: ctx.workspaceRoot,
-          maxBuffer: 1024 * 1024 * 10,
-          timeout: 30000,
-          windowsHide: true,
-        });
-        return stdout;
-      }, ctx);
-      return { id: randomUUID(), toolCallId: "", name: "run_command", success: true, output, durationMs };
+        return createErrorResult("run_command", toolCallId, ToolErrorCode.COMMAND_FAILED, `Command failed: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
+      }
     },
   };
 
@@ -363,13 +434,20 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       properties: {},
     },
     handler: async (_args, ctx) => {
-      const { result: output, durationMs } = await withPermission(evaluator, "git", "git status", async () => {
-        const { stdout } = await execFileAsync("git", ["status", "--porcelain"], {
-          cwd: ctx.workspaceRoot,
-        });
-        return stdout || "Working tree clean.";
-      }, ctx);
-      return { id: randomUUID(), toolCallId: "", name: "git_status", success: true, output, durationMs };
+      const toolCallId = randomUUID();
+      const start = Date.now();
+
+      try {
+        const { result: output, durationMs } = await withPermission(evaluator, "git", "git status", async () => {
+          const { stdout } = await execFileAsync("git", ["status", "--porcelain"], {
+            cwd: ctx.workspaceRoot,
+          });
+          return stdout || "Working tree clean.";
+        }, ctx);
+        return createSuccessResult("git_status", toolCallId, output, { durationMs, exitCode: 0 });
+      } catch (error) {
+        return createErrorResult("git_status", toolCallId, ToolErrorCode.GIT_FAILED, `Git status failed: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
+      }
     },
   };
 
@@ -383,13 +461,20 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       properties: {},
     },
     handler: async (_args, ctx) => {
-      const { result: output, durationMs } = await withPermission(evaluator, "git", "git diff", async () => {
-        const { stdout } = await execFileAsync("git", ["diff"], {
-          cwd: ctx.workspaceRoot,
-        });
-        return stdout || "No changes.";
-      }, ctx);
-      return { id: randomUUID(), toolCallId: "", name: "git_diff", success: true, output, durationMs };
+      const toolCallId = randomUUID();
+      const start = Date.now();
+
+      try {
+        const { result: output, durationMs } = await withPermission(evaluator, "git", "git diff", async () => {
+          const { stdout } = await execFileAsync("git", ["diff"], {
+            cwd: ctx.workspaceRoot,
+          });
+          return stdout || "No changes.";
+        }, ctx);
+        return createSuccessResult("git_diff", toolCallId, output, { durationMs, exitCode: 0 });
+      } catch (error) {
+        return createErrorResult("git_diff", toolCallId, ToolErrorCode.GIT_FAILED, `Git diff failed: ${(error as Error).message}`, true, { durationMs: Date.now() - start });
+      }
     },
   };
 
