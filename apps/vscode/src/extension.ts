@@ -15,6 +15,12 @@ export function activate(context: vscode.ExtensionContext) {
 
     const config = vscode.workspace.getConfiguration("forgeai");
     const serverUrl = config.get<string>("serverUrl", "http://127.0.0.1:4141");
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+    if (!workspaceRoot) {
+      vscode.window.showErrorMessage("ForgeAI needs an opened folder or workspace before it can run a task.");
+      return;
+    }
 
     vscode.window.showInformationMessage(`Starting ForgeAI task: ${input}`);
 
@@ -39,9 +45,9 @@ export function activate(context: vscode.ExtensionContext) {
                 config: {
                   provider: {
                     type: config.get<string>("provider.type", "gemini"),
-                    model: config.get<string>("provider.model", "gemini-pro"),
+                    model: config.get<string>("provider.model", "gemini-3.6-flash"),
                   },
-                  workspaceRoot: vscode.workspace.rootPath || "",
+                  workspaceRoot,
                   permissionPolicy: {
                     rules: [],
                     defaultLevel: "approval",
@@ -53,7 +59,12 @@ export function activate(context: vscode.ExtensionContext) {
             });
 
             if (!response.ok) {
-              panel.webview.postMessage({ type: "error", text: `Server error: ${response.statusText}` });
+              const errorBody = await response.json().catch(() => null) as { error?: string; details?: { path: string; message: string }[] } | null;
+              const details = errorBody?.details?.map((detail) => `${detail.path}: ${detail.message}`).join("; ");
+              panel.webview.postMessage({
+                type: "error",
+                text: errorBody?.error ? `${errorBody.error}${details ? ` (${details})` : ""}` : `Server error: ${response.status} ${response.statusText}`,
+              });
               return;
             }
 

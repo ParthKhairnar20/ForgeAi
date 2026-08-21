@@ -76,6 +76,16 @@ describe("tool security", () => {
     expect(result.error).toContain("blocked");
   });
 
+  it("run_command should support PowerShell built-in commands on Windows", async () => {
+    const tool = tools.get("run_command")!;
+    await fs.mkdir(testCtx.workspaceRoot, { recursive: true });
+
+    const result = await tool.handler({ command: "pwd" }, testCtx);
+
+    expect(result.success).toBe(true);
+    expect(result.output).toContain("forgeai-test-workspace");
+  });
+
   it("read_file should reject sensitive files like .env", async () => {
     const tool = tools.get("read_file")!;
     const result = await tool.handler({ path: path.join(testCtx.workspaceRoot, ".env") }, testCtx);

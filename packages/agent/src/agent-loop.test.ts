@@ -19,6 +19,20 @@ function createTestConfig(provider: any): ForgeAIConfig {
 }
 
 describe("AgentLoop", () => {
+  it("should complete when the mock provider has no configured responses", async () => {
+    const config = createTestConfig({ type: "mock", model: "mock" });
+    const loop = new AgentLoop(config, createNoopLogger());
+    (loop as any).provider = new MockProvider([], createNoopLogger());
+
+    const events: any[] = [];
+    for await (const event of loop.run("Confirm the mock provider")) {
+      events.push(event);
+    }
+
+    const completeEvent = events.find((e) => e.type === "complete");
+    expect(completeEvent.state.status).toBe("completed");
+  });
+
   it("should complete when provider returns text without tool calls", async () => {
     const responses: MockResponse[] = [
       { content: "Task completed successfully.", toolCalls: [] },
@@ -36,6 +50,22 @@ describe("AgentLoop", () => {
     expect(completeEvent).toBeDefined();
     expect(completeEvent.state.status).toBe("completed");
     expect(completeEvent.state.messages.some((m: any) => m.content.includes("Task completed successfully"))).toBe(true);
+  });
+
+  it("should report cancellation when cancel is called during a provider request", async () => {
+    const config = createTestConfig({ type: "mock", model: "mock" });
+    const loop = new AgentLoop(config, createNoopLogger());
+    (loop as any).provider = new MockProvider([{ content: "late response", delayMs: 20 }], createNoopLogger());
+
+    const events: any[] = [];
+    const run = (async () => {
+      for await (const event of loop.run("Cancel this task")) events.push(event);
+    })();
+    loop.cancel();
+    await run;
+
+    const completeEvent = events.find((event) => event.type === "complete");
+    expect(completeEvent.state.status).toBe("cancelled");
   });
 
   it("should execute tools and collect results", async () => {
@@ -64,6 +94,8 @@ describe("AgentLoop", () => {
     const toolMessages = completeEvent.state.messages.filter((m: any) => m.role === "tool");
     expect(toolMessages.length).toBeGreaterThanOrEqual(1);
     expect(toolMessages[0].metadata.success).toBe(true);
+    const assistantMessage = completeEvent.state.messages.find((m: any) => m.role === "assistant");
+    expect(assistantMessage.toolCalls).toHaveLength(1);
   });
 
   it("should request correction when a tool fails", async () => {

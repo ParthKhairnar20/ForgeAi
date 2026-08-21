@@ -1,7 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 
-import { ForgeAIConfig, resolveProviderApiKey } from "@forgeai/core";
+import { ForgeAIConfig, resolveProviderApiKey, validateConfig } from "@forgeai/core";
 import { AgentLoop } from "@forgeai/agent";
 
 const fastify = Fastify({ logger: true });
@@ -48,6 +48,15 @@ fastify.post("/api/agent/run", async (request, reply) => {
   } catch (error) {
     return reply.status(400).send({ error: (error as Error).message });
   }
+
+  const validation = validateConfig(resolvedConfig);
+  if (!validation.success || !validation.data) {
+    return reply.status(400).send({
+      error: "Invalid agent configuration.",
+      details: validation.error?.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
+    });
+  }
+  resolvedConfig = validation.data;
 
   const providerLabel = (resolvedConfig.provider as any).primary
     ? `${(resolvedConfig.provider as any).primary.type} → ${(resolvedConfig.provider as any).fallback?.type || "none"}`

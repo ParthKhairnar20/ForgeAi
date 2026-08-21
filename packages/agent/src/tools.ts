@@ -57,8 +57,11 @@ async function validateWorkspacePath(workspaceRoot: string, userPath: string): P
           throw new Error(`Access denied: path "${userPath}" contains a symlink that resolves outside the workspace.`);
         }
       }
-    } catch {
-      // not a symlink or readlink failed
+    } catch (error) {
+      if ((error as Error).message.startsWith("Access denied:")) {
+        throw error;
+      }
+      // Not a symlink or an unreadable path segment.
     }
     current = path.resolve(current, "..");
   }
@@ -241,6 +244,7 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       const query = String(args.query);
       const searchPath = await validateWorkspacePath(ctx.workspaceRoot, userPath);
       const rg = await findRipgrep();
+      const gitignorePatterns = await getGitignorePatterns(ctx.workspaceRoot);
 
       const { result: output, durationMs } = await withPermission(evaluator, "search", userPath, async () => {
         if (rg) {
@@ -250,11 +254,16 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
               maxBuffer: 1024 * 1024 * 10,
               windowsHide: true,
             });
-            const results = stdout.split("\n").filter((l) => l.trim()).map((line) => {
+            const results: { file: string; line: number; content: string }[] = [];
+            for (const line of stdout.split("\n")) {
+              if (!line.trim()) continue;
               const match = line.match(/^(.+?):(\d+):(.*)$/);
-              if (!match) return null;
-              return { file: match[1], line: parseInt(match[2], 10), content: match[3] };
-            }).filter(Boolean);
+              if (!match) continue;
+              const file = match[1];
+              const relative = path.relative(ctx.workspaceRoot, file);
+              if (isSensitiveFile(path.basename(file)) || shouldIgnore(relative, gitignorePatterns)) continue;
+              results.push({ file, line: parseInt(match[2], 10), content: match[3] });
+            }
             return JSON.stringify(results, null, 2);
           } catch (error: any) {
             if (error.code === 1) return JSON.stringify([], null, 2);
@@ -262,7 +271,6 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
           }
         }
 
-        const gitignorePatterns = await getGitignorePatterns(ctx.workspaceRoot);
         const results: { file: string; line: number; content: string }[] = [];
         const files = await getAllFiles(searchPath, gitignorePatterns);
         for (const file of files) {
@@ -312,7 +320,28 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       }
 
       const { result: output, durationMs } = await withPermission(evaluator, "shell", command, async () => {
-        const { stdout } = await execFileAsync(command, cmdArgs, {
+        if (ctx.platform === "win32") {
+          const executable = "powershell.exe";
+          const executableArgs = [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `& ${toPowerShellLiteral(command)} ${cmdArgs.map(toPowerShellLiteral).join(" ")}`,
+          ];
+          const { stdout } = await execFileAsync(executable, executableArgs, {
+            cwd: ctx.workspaceRoot,
+            maxBuffer: 1024 * 1024 * 10,
+            timeout: 30000,
+            windowsHide: true,
+          });
+          return stdout;
+        }
+
+        // On Unix-like platforms, split the command into executable + args
+        const parts = command.trim().split(/\s+/);
+        const executable = parts[0];
+        const unixArgs = [...parts.slice(1), ...cmdArgs];
+        const { stdout } = await execFileAsync(executable, unixArgs, {
           cwd: ctx.workspaceRoot,
           maxBuffer: 1024 * 1024 * 10,
           timeout: 30000,
@@ -379,6 +408,10 @@ export function createBuiltinTools(evaluator: PermissionEvaluator): ToolDefiniti
       }
     }
     return files;
+  }
+
+  function toPowerShellLiteral(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`;
   }
 
   return [readFileTool, writeFileTool, listFilesTool, searchFilesTool, runCommandTool, gitStatusTool, gitDiffTool];

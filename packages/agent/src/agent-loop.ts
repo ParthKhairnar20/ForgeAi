@@ -18,9 +18,9 @@ import {
   ToolDefinition,
   ToolResult,
 } from "@forgeai/core";
-import { createBuiltinTools } from "./tools";
-import { createProvider, ModelRouter } from "./providers";
-import { discoverContextFiles, readContextFiles } from "./context";
+import { createBuiltinTools } from "./tools.js";
+import { createProvider, ModelRouter } from "./providers/index.js";
+import { discoverContextFiles, readContextFiles } from "./context.js";
 
 export type AgentEvent =
   | { type: "step"; step: AgentStep }
@@ -118,6 +118,7 @@ export class AgentLoop {
 
         const step = this.startStep("think", `Iteration ${i + 1}: Planning`);
         yield this.emitStep(step, options);
+        let stepCompleted = false;
 
         const toolCalls: ToolCall[] = [];
         const effectiveProvider = this.getEffectiveProviderConfig();
@@ -130,6 +131,15 @@ export class AgentLoop {
 
         let fullContent = "";
         for await (const chunk of this.provider.streamChat(this.state.messages, streamOptions)) {
+          if (this.abortController?.signal.aborted) {
+            this.state.status = "cancelled";
+            yield this.emitState(options);
+            yield { type: "complete", state: { ...this.state } };
+            return;
+          }
+          if (chunk.error) {
+            throw new Error(chunk.error);
+          }
           if (options?.cancellationToken?.cancelled) {
             this.state.status = "cancelled";
             yield this.emitState(options);
@@ -142,7 +152,7 @@ export class AgentLoop {
             toolCalls.push(...chunk.toolCalls);
           }
           if (chunk.done) {
-            const assistantMessage = this.createAssistantMessage(fullContent, toolCalls);
+            const assistantMessage = this.createAssistantMessage(fullContent, toolCalls, chunk.metadata);
             this.state.messages.push(assistantMessage);
 
             if (toolCalls.length > 0) {
@@ -156,10 +166,25 @@ export class AgentLoop {
               }
               this.trimMessages();
 
-              this.completeStep(editStep);
+              const needsCorrection = results.some((r) => !r.success);
+
+              // Mark the edit step as completed or failed
+              editStep.endTime = Date.now();
+              if (needsCorrection) {
+                editStep.status = "failed";
+                editStep.error = "One or more tool calls failed.";
+              } else {
+                editStep.status = "completed";
+                editStep.result = `${results.length} tool call(s) succeeded`;
+              }
+              this.state.steps.push(editStep);
               yield this.emitStep(editStep, options);
 
-              const needsCorrection = results.some((r) => !r.success);
+              // Complete the think step
+              this.completeStep(step, fullContent);
+              stepCompleted = true;
+              yield this.emitStep(step, options);
+
               if (needsCorrection) {
                 this.logger.warn("Tool execution failed, requesting correction.");
                 const correctionPrompt = "Some operations failed. Please analyze the errors and retry with corrected actions.";
@@ -173,6 +198,7 @@ export class AgentLoop {
             } else {
               this.state.status = "completed";
               this.completeStep(step, fullContent);
+              stepCompleted = true;
               yield this.emitStep(step, options);
               yield { type: "complete", state: { ...this.state } };
               shouldStop = true;
@@ -181,7 +207,7 @@ export class AgentLoop {
           }
         }
 
-        if (!shouldStop) {
+        if (!stepCompleted) {
           this.completeStep(step, fullContent);
           yield this.emitStep(step, options);
         }
@@ -223,6 +249,7 @@ export class AgentLoop {
 
       try {
         const result = await tool.handler(call.arguments, this.toolContext);
+        result.toolCallId = call.id;
         results.push(result);
         this.logger.info(`Tool ${call.name} executed: ${result.success ? "success" : "failure"}`);
       } catch (error) {
@@ -281,13 +308,14 @@ export class AgentLoop {
     };
   }
 
-  private createAssistantMessage(content: string, toolCalls?: ToolCall[]): Message {
+  private createAssistantMessage(content: string, toolCalls?: ToolCall[], metadata?: Record<string, unknown>): Message {
     return {
       id: randomUUID(),
       role: "assistant",
       content,
       timestamp: Date.now(),
-      toolCalls,
+      toolCalls: toolCalls ? [...toolCalls] : undefined,
+      metadata,
     };
   }
 
@@ -299,7 +327,12 @@ export class AgentLoop {
         ? `[${result.name}]\n${result.output}`
         : `[${result.name}] ERROR: ${result.error}`,
       timestamp: Date.now(),
-      metadata: { success: result.success, durationMs: result.durationMs },
+      metadata: {
+        name: result.name,
+        toolCallId: result.toolCallId,
+        success: result.success,
+        durationMs: result.durationMs,
+      },
     };
   }
 
@@ -313,10 +346,14 @@ export class AgentLoop {
   }
 
   private emitStep(step: AgentStep, options?: AgentLoopOptions): AgentEvent {
-    return { type: "step", step };
+    const event: AgentEvent = { type: "step", step };
+    options?.onEvent?.(event);
+    return event;
   }
 
   private emitState(options?: AgentLoopOptions): AgentEvent {
-    return { type: "state", state: { ...this.state } };
+    const event: AgentEvent = { type: "state", state: { ...this.state } };
+    options?.onEvent?.(event);
+    return event;
   }
 }

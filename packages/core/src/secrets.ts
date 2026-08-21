@@ -8,17 +8,20 @@ export function resolveProviderApiKey(config: { type: string; apiKey?: string },
   const envVarMap: Record<string, string> = {
     gemini: "GEMINI_API_KEY",
     openrouter: "OPENROUTER_API_KEY",
-    groq: "OPENROUTER_API_KEY",
+    groq: "GROQ_API_KEY",
     ollama: "OLLAMA_API_KEY",
     mock: "",
   };
 
   const envVar = envVarMap[type];
+  if (type === "mock") {
+    return "";
+  }
   if (!envVar) {
     throw new Error(`Unknown provider type: ${config.type}`);
   }
 
-  const key = env[envVar];
+  const key = env[envVar]?.trim();
   if (!key) {
     throw new Error(`Missing API key for provider "${config.type}". Set ${envVar} environment variable.`);
   }

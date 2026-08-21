@@ -9,6 +9,27 @@
   "activationEvents": [],
   "main": "dist/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "ForgeAI",
+      "properties": {
+        "forgeai.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:4141",
+          "description": "Address of the local ForgeAI server."
+        },
+        "forgeai.provider.type": {
+          "type": "string",
+          "enum": ["gemini", "openrouter", "groq", "ollama", "mock"],
+          "default": "gemini",
+          "description": "Model provider used by ForgeAI."
+        },
+        "forgeai.provider.model": {
+          "type": "string",
+          "default": "gemini-3.6-flash",
+          "description": "Provider-specific model identifier."
+        }
+      }
+    },
     "viewsContainers": {
       "activitybar": [
         {

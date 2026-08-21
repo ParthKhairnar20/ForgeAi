@@ -105,7 +105,7 @@ Open VS Code settings (`Ctrl+,`) and search for `forgeai`:
 |---------|---------|-------------|
 | `forgeai.serverUrl` | `http://127.0.0.1:4141` | ForgeAI server URL |
 | `forgeai.provider.type` | `gemini` | Provider: `gemini`, `openrouter`, `mock` |
-| `forgeai.provider.model` | `gemini-pro` | Model name (provider-specific) |
+| `forgeai.provider.model` | `gemini-3.6-flash` | Model name (provider-specific) |
 
 ## Starting the Server
 

@@ -62,6 +62,15 @@ describe("resolveProviderApiKey", () => {
     expect(result).toBe("env-or-key");
   });
 
+  it("should use GROQ_API_KEY for groq", () => {
+    const result = resolveProviderApiKey({ type: "groq", apiKey: "" }, { GROQ_API_KEY: "env-groq-key" });
+    expect(result).toBe("env-groq-key");
+  });
+
+  it("should not require an API key for the mock provider", () => {
+    expect(resolveProviderApiKey({ type: "mock", apiKey: "" }, {})).toBe("");
+  });
+
   it("should throw when no apiKey and no env var for gemini", () => {
     expect(() => resolveProviderApiKey({ type: "gemini", apiKey: "" }, {})).toThrow("Missing API key");
   });

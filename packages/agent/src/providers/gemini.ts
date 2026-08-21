@@ -1,68 +1,59 @@
-import { GoogleGenerativeAI, GenerativeModel, Content } from "@google/generative-ai";
-import { Message, ModelChunk, ProviderConfig, StreamOptions } from "@forgeai/core";
-import { BaseProvider } from "./base-provider";
+import { Content, FunctionDeclaration, GoogleGenAI, Type } from "@google/genai";
+import { randomUUID } from "crypto";
+import { Message, ModelChunk, ProviderConfig, StreamOptions, ToolCall } from "@forgeai/core";
+import { BaseProvider } from "./base-provider.js";
 
 export class GeminiProvider extends BaseProvider {
   name = "gemini";
-  private model: GenerativeModel;
-  private genAI: GoogleGenerativeAI;
+  private readonly client: GoogleGenAI;
 
   constructor(private readonly config: ProviderConfig, logger: { info: (m: string) => void; error: (m: string, e?: Error) => void; warn: (m: string) => void; debug: (m: string) => void }) {
     super(logger);
-
-    if (!config.apiKey) {
-      throw new Error("Gemini API key is required. Set GEMINI_API_KEY environment variable or configure provider.apiKey.");
-    }
-
-    this.genAI = new GoogleGenerativeAI(config.apiKey);
-    const modelName = config.model || "gemini-pro";
-    this.model = this.genAI.getGenerativeModel({ model: modelName });
+    if (!config.apiKey) throw new Error("Gemini API key is required. Set GEMINI_API_KEY environment variable or configure provider.apiKey.");
+    this.client = new GoogleGenAI({ apiKey: config.apiKey });
   }
 
-  async *streamChat(
-    messages: Message[],
-    options: StreamOptions
-  ): AsyncIterable<ModelChunk> {
+  async *streamChat(messages: Message[], options: StreamOptions): AsyncIterable<ModelChunk> {
     try {
-      const history = this.buildHistory(messages);
-      const userMessage = this.extractLastUserMessage(messages);
-
-      const chat = this.model.startChat({ history });
-      const result = await chat.sendMessageStream(userMessage || "Continue.", {
-        signal: options.signal,
+      const { systemInstruction, contents } = this.buildContents(messages);
+      const stream = await this.client.models.generateContentStream({
+        model: this.config.model || "gemini-3.6-flash",
+        contents,
+        config: {
+          systemInstruction,
+          temperature: options.temperature,
+          maxOutputTokens: options.maxTokens,
+          abortSignal: options.signal,
+          tools: options.tools?.length ? [{ functionDeclarations: options.tools.map((tool) => this.toFunctionDeclaration(tool)) }] : undefined,
+        },
       });
 
-      let fullContent = "";
-      for await (const chunk of result.stream) {
+      let finalContent: Content | undefined;
+      let finalToolCalls: ToolCall[] | undefined;
+      for await (const chunk of stream) {
         if (options.signal?.aborted) {
           yield { content: "", done: true };
           return;
         }
-        const text = chunk.text();
-        if (text) {
-          fullContent += text;
-          yield {
-            content: text,
-            done: false,
-          };
-        }
+        const content = chunk.candidates?.[0]?.content;
+        if (content) finalContent = content;
+        const calls = chunk.functionCalls?.map((call) => ({
+          id: call.id || randomUUID(),
+          name: call.name || "",
+          arguments: (call.args || {}) as Record<string, unknown>,
+        })).filter((call) => call.name);
+        if (calls?.length) finalToolCalls = calls;
+        if (chunk.text) yield { content: chunk.text, done: false };
       }
 
-      const response = await result.response;
-      const usageMetadata = response.usageMetadata;
-      yield {
-        content: "",
-        done: true,
-        usage: {
-          promptTokens: usageMetadata?.promptTokenCount ?? 0,
-          completionTokens: usageMetadata?.candidatesTokenCount ?? 0,
-        },
-      };
+      yield { content: "", done: true, toolCalls: finalToolCalls, metadata: finalContent ? { geminiContent: finalContent } : undefined };
     } catch (error) {
       this.logger.error("GeminiProvider streamChat failed", error as Error);
-      if ((error as any).status === 429) {
+      if (options.signal?.aborted || (error as { name?: string }).name === "AbortError") {
+        yield { content: "", done: true };
+      } else if ((error as { status?: number }).status === 429) {
         yield { content: "", done: true, error: "Rate limit exceeded. Please retry later." };
-      } else if ((error as any).status === 401) {
+      } else if ((error as { status?: number }).status === 401) {
         yield { content: "", done: true, error: "Authentication failed. Check your API key." };
       } else {
         yield { content: "", done: true, error: `Gemini API error: ${(error as Error).message}` };
@@ -70,29 +61,48 @@ export class GeminiProvider extends BaseProvider {
     }
   }
 
-  supportsStreaming(): boolean {
-    return true;
-  }
+  supportsStreaming(): boolean { return true; }
 
-  private buildHistory(messages: Message[]): Content[] {
-    const history: Content[] = [];
-    for (let i = 0; i < messages.length - 1; i++) {
-      const msg = messages[i];
-      if (msg.role === "user") {
-        history.push({ role: "user", parts: [{ text: msg.content }] });
-      } else if (msg.role === "assistant") {
-        history.push({ role: "model", parts: [{ text: msg.content }] });
+  private buildContents(messages: Message[]): { systemInstruction?: Content; contents: Content[] } {
+    const contents: Content[] = [];
+    let systemInstruction: Content | undefined;
+    for (const message of messages) {
+      if (message.role === "system") {
+        systemInstruction = { role: "user", parts: [{ text: message.content }] };
+      } else if (message.role === "assistant") {
+        const originalContent = message.metadata?.geminiContent as Content | undefined;
+        contents.push(originalContent || {
+          role: "model",
+          parts: message.toolCalls?.length
+            ? message.toolCalls.map((call) => ({ functionCall: { id: call.id, name: call.name, args: call.arguments } }))
+            : [{ text: message.content }],
+        });
+      } else if (message.role === "tool") {
+        const name = typeof message.metadata?.name === "string" ? message.metadata.name : "tool";
+        const id = typeof message.metadata?.toolCallId === "string" ? message.metadata.toolCallId : undefined;
+        contents.push({ role: "user", parts: [{ functionResponse: { id, name, response: { result: message.content } } }] });
+      } else {
+        contents.push({ role: "user", parts: [{ text: message.content }] });
       }
     }
-    return history;
+    return { systemInstruction, contents };
   }
 
-  private extractLastUserMessage(messages: Message[]): string {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user") {
-        return messages[i].content;
-      }
-    }
-    return "";
+  private toFunctionDeclaration(tool: NonNullable<StreamOptions["tools"]>[number]): FunctionDeclaration {
+    return {
+      name: tool.name,
+      description: tool.description,
+      parameters: {
+        type: Type.OBJECT,
+        properties: Object.fromEntries(Object.entries(tool.parameters.properties).map(([name, schema]) => [name, this.toSchema(schema)])),
+        required: tool.parameters.required,
+      },
+    };
+  }
+
+  private toSchema(schema: unknown): Record<string, unknown> {
+    const value = schema as { type?: string; description?: string; items?: unknown };
+    const typeMap: Record<string, Type> = { string: Type.STRING, number: Type.NUMBER, integer: Type.INTEGER, boolean: Type.BOOLEAN, array: Type.ARRAY, object: Type.OBJECT };
+    return { type: typeMap[value.type || "string"] || Type.STRING, description: value.description, ...(value.items ? { items: this.toSchema(value.items) } : {}) };
   }
 }

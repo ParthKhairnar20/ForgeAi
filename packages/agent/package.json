@@ -13,7 +13,9 @@
   },
   "dependencies": {
     "@forgeai/core": "workspace:*",
+    "@google/genai": "^2.18.0",
     "@google/generative-ai": "^0.24.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^3.22.0"
   },
   "devDependencies": {

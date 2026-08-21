@@ -1,15 +1,15 @@
 import { Logger, ProviderConfig, RouterConfig } from "@forgeai/core";
-import { GeminiProvider } from "./gemini";
-import { OpenRouterProvider } from "./openrouter";
-import { OllamaProvider } from "./ollama";
-import { MockProvider } from "./mock";
-import { ModelRouter } from "./model-router";
-import { BaseProvider } from "./base-provider";
+import { GeminiProvider } from "./gemini.js";
+import { OpenRouterProvider } from "./openrouter.js";
+import { OllamaProvider } from "./ollama.js";
+import { MockProvider } from "./mock.js";
+import { ModelRouter } from "./model-router.js";
+import { BaseProvider } from "./base-provider.js";
 
-export { MockProvider } from "./mock";
-export type { MockResponse } from "./mock";
-export { ModelRouter } from "./model-router";
-export type { RouterDecision } from "./model-router";
+export { MockProvider } from "./mock.js";
+export type { MockResponse } from "./mock.js";
+export { ModelRouter } from "./model-router.js";
+export type { RouterDecision } from "./model-router.js";
 
 export function createProvider(config: ProviderConfig | RouterConfig, logger: Logger): BaseProvider {
   if ((config as RouterConfig).primary) {
@@ -24,7 +24,11 @@ export function createProvider(config: ProviderConfig | RouterConfig, logger: Lo
     case "openrouter":
       return new OpenRouterProvider(providerConfig, logger);
     case "groq":
-      return new OpenRouterProvider({ ...providerConfig, type: "openrouter" }, logger);
+      return new OpenRouterProvider({
+        ...providerConfig,
+        type: "openrouter",
+        baseURL: providerConfig.baseURL || "https://api.groq.com/openai/v1",
+      }, logger);
     case "ollama":
       return new OllamaProvider(providerConfig, logger);
     case "mock":

@@ -1,7 +1,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { analyzeFile } from "./symbols";
-import { createContextBudget } from "./context-budget";
+import { analyzeFile } from "./symbols.js";
+import { createContextBudget } from "./context-budget.js";
 
 export interface ContextFile {
   path: string;
@@ -37,8 +37,8 @@ const SENSITIVE_FILE_PATTERNS = [
 const MAX_SINGLE_FILE_BYTES = 20000;
 const DEFAULT_MAX_CONTEXT_BYTES = 80000;
 
-export { createContextBudget } from "./context-budget";
-export type { ContextBudget } from "./context-budget";
+export { createContextBudget } from "./context-budget.js";
+export type { ContextBudget } from "./context-budget.js";
 
 export async function discoverContextFiles(workspaceRoot: string, task: string, contextWindowLimit = DEFAULT_MAX_CONTEXT_BYTES): Promise<ContextFile[]> {
   const gitignorePatterns = await readGitignore(workspaceRoot);

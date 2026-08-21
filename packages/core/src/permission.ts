@@ -1,4 +1,4 @@
-import { CancellationToken, CommandCategory, Logger, PermissionLevel, PermissionPolicy, Platform, ToolContext } from "./types";
+import { CancellationToken, CommandCategory, Logger, PermissionLevel, PermissionPolicy, Platform, ToolContext } from "./types.js";
 
 export class PermissionEvaluator {
   constructor(

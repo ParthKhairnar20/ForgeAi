@@ -15,7 +15,7 @@ import {
   ToolContext,
   ToolDefinition,
   ToolResult,
-} from "./types";
+} from "./types.js";
 
 export const ProviderConfigSchema = z.object({
   type: z.enum(["gemini", "openrouter", "groq", "ollama", "mock"]),

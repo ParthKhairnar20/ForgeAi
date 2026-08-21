@@ -123,6 +123,7 @@ export interface ModelChunk {
   toolCalls?: ToolCall[];
   done: boolean;
   error?: string;
+  metadata?: Record<string, unknown>;
   usage?: {
     promptTokens: number;
     completionTokens: number;

@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { Message, ModelChunk, StreamOptions } from "@forgeai/core";
-import { BaseProvider } from "./base-provider";
+import { BaseProvider } from "./base-provider.js";
 
 export interface MockResponse {
   content: string;
@@ -23,6 +23,14 @@ export class MockProvider extends BaseProvider {
     _messages: Message[],
     _options: StreamOptions
   ): AsyncIterable<ModelChunk> {
+    if (this.responses.length === 0) {
+      yield {
+        content: "Mock provider completed without a configured response.",
+        done: true,
+      };
+      return;
+    }
+
     for (const response of this.responses) {
       if (response.delayMs) {
         await new Promise((resolve) => setTimeout(resolve, response.delayMs));

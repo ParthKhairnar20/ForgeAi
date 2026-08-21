@@ -1,5 +1,5 @@
 import { Message, ModelChunk, ProviderConfig, StreamOptions } from "@forgeai/core";
-import { BaseProvider } from "./base-provider";
+import { BaseProvider } from "./base-provider.js";
 
 export class OllamaProvider extends BaseProvider {
   name = "ollama";

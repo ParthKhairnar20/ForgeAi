@@ -1,8 +1,8 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "Node",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "lib": ["ES2022"],
     "strict": true,
     "esModuleInterop": true,
@@ -14,10 +14,9 @@
     "sourceMap": true,
     "outDir": "dist",
     "rootDir": "src",
-    "baseUrl": ".",
     "paths": {
-      "@forgeai/core": ["packages/core/src"],
-      "@forgeai/agent": ["packages/agent/src"]
+      "@forgeai/core": ["./packages/core/src"],
+      "@forgeai/agent": ["./packages/agent/src"]
     }
   },
   "exclude": ["node_modules", "dist", "**/*.test.ts"]

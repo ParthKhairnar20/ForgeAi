@@ -1,6 +1,6 @@
 import { Logger, Message, ModelChunk, ProviderConfig, StreamOptions } from "@forgeai/core";
-import { BaseProvider } from "./base-provider";
-import { createProvider } from "./index";
+import { BaseProvider } from "./base-provider.js";
+import { createProvider } from "./index.js";
 
 export interface RouterDecision {
   providerName: string;
@@ -38,6 +38,9 @@ export class ModelRouter extends BaseProvider {
       this.logger.info(`Routing to primary provider: ${this.primaryProvider.name}`);
 
       for await (const chunk of this.primaryProvider.streamChat(messages, options)) {
+        if (chunk.error) {
+          throw new Error(chunk.error);
+        }
         yield chunk;
         if (chunk.done) return;
       }
@@ -59,6 +62,9 @@ export class ModelRouter extends BaseProvider {
         this.logger.info(`Falling back to: ${this.fallbackProvider.name}`);
 
         for await (const chunk of this.fallbackProvider.streamChat(messages, options)) {
+          if (chunk.error) {
+            throw new Error(chunk.error);
+          }
           yield chunk;
           if (chunk.done) return;
         }
